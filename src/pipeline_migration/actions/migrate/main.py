@@ -14,6 +14,7 @@ from jsonschema.exceptions import ValidationError
 from jsonschema.validators import Draft202012Validator
 from ruamel.yaml.error import YAMLError
 
+from pipeline_migration.actions.migrate import sandbox
 from pipeline_migration.actions.migrate.constants import (
     ANNOTATION_IS_MIGRATION,
     MIGRATION_IMAGE_TAG_LIKE_PATTERN,
@@ -56,6 +57,11 @@ class MigrationFileOperation(PipelineFileOperation):
         fd, migration_file = tempfile.mkstemp(suffix="-migration-file")
         prev_size = 0
         errors: list[Exception] = []
+        use_sandbox = sandbox.is_available()
+        if use_sandbox:
+            logger.info("Sandbox available — migration scripts will run in isolation")
+        else:
+            logger.warning("Sandbox not available — migration scripts run without isolation")
 
         for bundle_upgrade in self._task_bundle_upgrades:
             for migration in bundle_upgrade.migrations:
@@ -72,7 +78,10 @@ class MigrationFileOperation(PipelineFileOperation):
                         os.truncate(fd, len(content))
                     prev_size = os.write(fd, content)
 
-                    cmd = ["bash", migration_file, file_path]
+                    if use_sandbox:
+                        cmd = sandbox.build_cmd(migration_file, str(file_path))
+                    else:
+                        cmd = ["bash", migration_file, str(file_path)]
                     logger.debug("Run: %r", cmd)
                     proc = sp.run(cmd, stderr=sp.STDOUT, stdout=sp.PIPE)
                     logger.debug("%r", proc.stdout)
