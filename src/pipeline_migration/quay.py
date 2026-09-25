@@ -9,12 +9,15 @@ from pipeline_migration.registry import Container
 
 @dataclass
 class QuayTagInfo:
+    """Holds name, digest, and timestamp for a Quay repository tag."""
+
     name: str
     manifest_digest: str
     start_ts: int
 
     @classmethod
     def from_tag_info(cls, tag_info: dict) -> "QuayTagInfo":
+        """Construct a QuayTagInfo from a Quay API tag dict."""
         return cls(
             name=tag_info["name"],
             manifest_digest=tag_info["manifest_digest"],
@@ -23,7 +26,7 @@ class QuayTagInfo:
 
 
 def list_active_repo_tags(
-    c: Container, tag_name: str = "", tag_name_pattern: str = ""
+    c: Container, tag_name: str = "", tag_name_pattern: str = "", per_page: int = 0
 ) -> Generator[dict, Any, None]:
     """List repository tags
 
@@ -39,18 +42,20 @@ def list_active_repo_tags(
             params["specificTag"] = tag_name
         if tag_name_pattern:
             params["filter_tag_name"] = f"like:{tag_name_pattern}"
+        if per_page > 0:
+            params["limit"] = str(per_page)
         api_url = f"https://{c.registry}/api/v1/repository/{c.namespace}/{c.repository}/tag/"
         resp = requests.get(api_url, params=params)
         resp.raise_for_status()
         data = resp.json()
-        for tag in data["tags"]:
-            yield tag
+        yield from data["tags"]
         if not data.get("has_additional"):
             break
         page = int(data["page"]) + 1
 
 
 def get_active_tag(c: Container, name: str) -> dict | None:
+    """Return the active tag with the given name, or None if not found."""
     try:
         return next(list_active_repo_tags(c, tag_name=name))
     except StopIteration:

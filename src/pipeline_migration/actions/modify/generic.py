@@ -1,0 +1,307 @@
+import argparse
+import copy
+import logging
+from pathlib import Path
+from typing import Any, Final
+
+from ruamel.yaml.comments import CommentedSeq, CommentedMap
+
+from pipeline_migration.yamleditor import EditYAMLEntry, YAMLPath
+from pipeline_migration.utils import YAMLStyle, create_yaml_obj, load_yaml
+from pipeline_migration.actions.modify.common import run_modify
+from pipeline_migration.actions.modify.common import get_nested
+
+logger = logging.getLogger("modify.generic")
+
+
+SUBCMD_DESCRIPTION: Final = """\
+
+Subcommanad "generic" requires path within the YAML doc in "yq" path function style,
+where an operation should be executed.
+
+YAML path is list of indexes in YAML format.
+For example:
+- spec
+- tasks
+- 5
+
+It can be also written on singleline in YAML flow format: '["spec", "tasks", 5]'.
+
+The following are several examples with a raw yaml modification:
+
+* Modify an yaml item within relative .tekton/ directory.
+
+    cd /path/to/repo
+    pmt modify generic insert '["path", "to", "yaml", "item"]' '{"new": "item"}'
+
+* Modify an yaml item in multiple pipelines in several repositories:
+
+    pmt modify \\
+        -f /path/to/repo1/.tekton/pr.yaml -f /path/to/repo2/.tekton/push.yaml \\
+        generic replace \\
+        '["path", "to", "yaml", "item", 3]' '{"replaced": "new"}'
+
+* Remove a task using yq's `path` function:
+
+   pmt modify \\
+        -f .tekton/pr.yaml \\
+        generic remove \\
+        "$(yq '.spec.pipelineSpec.tasks[] | select(.name == "prefetch-dependencies") | \\
+            path' .tekton/pr.yaml)"
+
+WARNING: generic subcommand should be used as the last resort subcommand, it doesn't do any
+semantic validation for Konflux tasks.
+Use resource specific subcommands if they are available instead to have a proper validation.
+"""
+
+
+class YAMLPathNotFoundError(Exception):
+    """Exception when given path doesn't exist in the YAML doc"""
+
+
+class UnsupportedYAML(Exception):
+    """The file to modify contains unsupported YAML."""
+
+
+def _yaml_path_from_param(yaml_path_param: str) -> YAMLPath:
+    """Parses and validates yaml_path parameter and returns YAMLPath variable type"""
+    yaml = create_yaml_obj()
+    loaded_path_params = yaml.load(yaml_path_param)
+
+    yaml_path: YAMLPath = []
+
+    if not isinstance(loaded_path_params, list):
+        raise ValueError("Provided YAML path must be a sequence")
+
+    for item in loaded_path_params:
+        if not isinstance(item, (str, int)):
+            raise ValueError(
+                "Provided YAML path sequence must contain only string or integer values"
+            )
+        yaml_path.append(item)
+
+    return yaml_path
+
+
+def yaml_path_type(param: str) -> YAMLPath:
+    "Argparser custom type for yaml path validation"
+    try:
+        yaml_path = _yaml_path_from_param(param)
+    except Exception as e:
+        raise argparse.ArgumentTypeError(str(e))
+    else:
+        return yaml_path
+
+
+def _yaml_from_value_param(value: str) -> Any:
+    """Parses and validates value param"""
+
+    def make_block_style_yaml(y):
+        """Recursively updates"""
+        if not hasattr(y, "fa"):
+            # scalar node, nothing to do
+            return
+
+        y.fa.set_block_style()
+
+        if isinstance(y, dict):
+            for item in y.values():
+                make_block_style_yaml(item)
+        if isinstance(y, list):
+            for item in y:
+                make_block_style_yaml(item)
+
+    yaml = create_yaml_obj()
+    loaded_value = yaml.load(value)
+
+    make_block_style_yaml(loaded_value)
+
+    return loaded_value
+
+
+def yaml_value_type(param: str) -> Any:
+    """Argparser custom type for yaml value validation"""
+    try:
+        yaml_value = _yaml_from_value_param(param)
+    except Exception as e:
+        raise argparse.ArgumentTypeError(str(e))
+    else:
+        return yaml_value
+
+
+def register_cli(subparser) -> None:
+    """Register the 'generic' subcommand and its sub-actions on the CLI parser."""
+    mod_generic_parser = subparser.add_parser(
+        "generic",
+        help=(
+            "Generic modification of YAML file (specific resource subcommands should "
+            "be preferred)"
+        ),
+        description=SUBCMD_DESCRIPTION,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    subparser_mod = mod_generic_parser.add_subparsers(
+        title="subcommands to generic modifications", required=True
+    )
+
+    # insert
+    subparser_insert = subparser_mod.add_parser(
+        "insert",
+        help="Inserts item into YAML path",
+    )
+    subparser_insert.add_argument(
+        "yaml_path",
+        help=(
+            "YAML path (in YAML format). Must point to a sequence or a map item. "
+            "It's the same path as returned by yq's path function (list of indexes)"
+        ),
+        metavar="YAML-PATH",
+        type=yaml_path_type,
+    )
+    subparser_insert.add_argument(
+        "value",
+        help=(
+            "YAML value (in YAML format) to be inserted. "
+            "Insertion into map accepts only map values. "
+            "Insertion into sequence accepts any type."
+        ),
+        metavar="VALUE",
+        type=yaml_value_type,
+    )
+
+    subparser_insert.set_defaults(action=action_insert)
+
+    # replace
+    subparser_replace = subparser_mod.add_parser(
+        "replace",
+        help="Replaces item at given YAML path",
+    )
+    subparser_replace.add_argument(
+        "yaml_path",
+        help=(
+            "YAML path (in YAML format). "
+            "It's the same path as returned by yq's path function (list of indexes)"
+        ),
+        metavar="YAML-PATH",
+        type=yaml_path_type,
+    )
+    subparser_replace.add_argument(
+        "value",
+        help="YAML value (in YAML format) to be used as the replacement.",
+        metavar="VALUE",
+        type=yaml_value_type,
+    )
+
+    subparser_replace.set_defaults(action=action_replace)
+
+    # remove
+    subparser_remove = subparser_mod.add_parser(
+        "remove",
+        help="Removes item at given YAML path",
+    )
+    subparser_remove.add_argument(
+        "yaml_path",
+        help=(
+            "YAML path (in YAML format). "
+            "It's the same path as returned by yq's path function (list of indexes)"
+        ),
+        metavar="YAML-PATH",
+        type=yaml_path_type,
+    )
+
+    subparser_remove.set_defaults(action=action_remove)
+
+
+class ModGenericBase:
+    """Base class for generic resource modifications"""
+
+    def __init__(self, yaml_path: YAMLPath):
+        self.yaml_path = yaml_path
+
+    def validate_yaml_path(self, loaded_doc: Any, allow_scalar: bool = False):
+        """Validate that the YAML path exists and points to a valid node type."""
+        try:
+            tmp_doc = get_nested(copy.copy(loaded_doc), self.yaml_path)
+        except KeyError:
+            raise YAMLPathNotFoundError(
+                f"Given YAML path {self.yaml_path} doesn't exist in the doc"
+            )
+        else:
+            if not allow_scalar and not isinstance(tmp_doc, (CommentedSeq, CommentedMap)):
+                raise RuntimeError(
+                    f"Provided YAML path {self.yaml_path} must point to sequence or map"
+                )
+
+    def handle(self, file_path: str) -> None:
+        yaml_style = YAMLStyle.detect(file_path)
+        doc = load_yaml(file_path, yaml_style)
+        if not isinstance(doc, dict):
+            raise UnsupportedYAML(f"Given file {file_path} is not a YAML mapping.")
+        self.handle_generic_operation(Path(file_path), doc, yaml_style)
+
+    def handle_generic_operation(self, file_path: Path, loaded_doc: Any, style: YAMLStyle) -> None:
+        """Override this in subclasses."""
+        raise NotImplementedError
+
+
+class ModGenericInsert(ModGenericBase):
+    """Operation that inserts a value at a given YAML path."""
+
+    def __init__(self, yaml_path: YAMLPath, value: Any):
+        super().__init__(yaml_path)
+        self.value = value
+
+    def handle_generic_operation(self, file_path: Path, loaded_doc: Any, style: YAMLStyle) -> None:
+        """Insert the configured value at the YAML path in the pipeline file."""
+        logger.info("Inserting content into YAML path %s in file %s", self.yaml_path, file_path)
+        self.validate_yaml_path(loaded_doc)
+        yamledit = EditYAMLEntry(file_path, style=style)
+        yamledit.insert(self.yaml_path, self.value)
+
+
+def action_insert(args) -> None:
+    """CLI action handler to insert content at a YAML path in pipeline files."""
+    op = ModGenericInsert(args.yaml_path, args.value)
+    run_modify(op, args, skip_on=(YAMLPathNotFoundError,))
+
+
+class ModGenericReplace(ModGenericBase):
+    """Operation that replaces a value at a given YAML path."""
+
+    def __init__(self, yaml_path: YAMLPath, value: Any):
+        super().__init__(yaml_path)
+        self.value = value
+
+    def handle_generic_operation(self, file_path: Path, loaded_doc: Any, style: YAMLStyle) -> None:
+        """Replace the value at the YAML path in the pipeline file."""
+        logger.info("Replacing content at YAML path %s in file %s", self.yaml_path, file_path)
+        self.validate_yaml_path(loaded_doc, allow_scalar=True)
+        yamledit = EditYAMLEntry(file_path, style=style)
+        yamledit.replace(self.yaml_path, self.value)
+
+
+def action_replace(args) -> None:
+    """CLI action handler to replace content at a YAML path in pipeline files."""
+    op = ModGenericReplace(args.yaml_path, args.value)
+    run_modify(op, args, skip_on=(YAMLPathNotFoundError,))
+
+
+class ModGenericRemove(ModGenericBase):
+    """Operation that removes a value at a given YAML path."""
+
+    def __init__(self, yaml_path: YAMLPath):
+        super().__init__(yaml_path)
+
+    def handle_generic_operation(self, file_path: Path, loaded_doc: Any, style: YAMLStyle) -> None:
+        """Remove the node at the YAML path in the pipeline file."""
+        logger.info("Removing YAML path %s in file %s", self.yaml_path, file_path)
+        self.validate_yaml_path(loaded_doc, allow_scalar=True)
+        yamledit = EditYAMLEntry(file_path, style=style)
+        yamledit.delete(self.yaml_path)
+
+
+def action_remove(args) -> None:
+    """CLI action handler to remove content at a YAML path in pipeline files."""
+    op = ModGenericRemove(args.yaml_path)
+    run_modify(op, args, skip_on=(YAMLPathNotFoundError,))

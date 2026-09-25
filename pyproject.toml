@@ -10,11 +10,10 @@ authors = [
 ]
 description = "Pipeline migration tool for Konflux CI."
 readme = "README.md"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
 keywords = ["pipeline", "migration", "konflux", "ci"]
 classifiers = [
   "Intended Audience :: Developers",
-  "License :: OSI Approved :: Apache Software License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.12",
   "Topic :: Software Development :: Build Tools",
@@ -22,15 +21,21 @@ classifiers = [
 dynamic = ["version"]
 
 dependencies = [
-  "requests==2.32.4",
-  "ruamel.yaml==0.18.10",
-  "oras==0.2.31",
-  "jsonschema==4.23.0",
-  "packaging==25.0",
+  "jsonschema==4.26.0",
+  "oras==0.2.43",
+  "packaging==26.3",
+  "requests==2.34.2",
+  "ruamel.yaml==0.19.1",
 ]
 
 [project.optional-dependencies]
 test = [
+  # Black guarantees stable style in versions released in the same calendar year,
+  # but not across years. Pin the major version (which follows the release year).
+  # https://black.readthedocs.io/en/stable/the_black_code_style/index.html#stability-policy
+  "black~=26.0",
+  "flake8",
+  "mypy",
   "pytest",
   "pytest-cov",
   "responses",

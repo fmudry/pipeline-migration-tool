@@ -1,0 +1,750 @@
+import copy
+import contextlib
+import os
+import tempfile
+import textwrap
+from pathlib import Path
+from collections.abc import Sequence
+from typing import Any
+from io import StringIO
+
+from ruamel.yaml import CommentedMap, CommentedSeq
+
+
+from pipeline_migration.utils import load_yaml, create_yaml_obj, YAMLStyle, is_flow_style_seq
+
+# YAMLPath type represents path to YAML entity as sequences of strings
+# (for dictionaries) and integers (for arrays). Sequence items represent
+# indexes of the YAML entries.
+# For example, path ["test", 1, "entry"] results into value "one"
+# ---
+# test:
+#   - entry: zero
+#   - entry: one
+#
+YAMLPath = Sequence[int | str]
+PathStack = list[tuple[CommentedSeq | CommentedMap, str | int | None]]
+
+# End of file constant
+EOF = -1
+
+
+def _adjust_comment_token(token: Any, offset: int) -> None:
+    """Shift a CommentToken's column position and embedded whitespace left by ``offset``.
+
+    Handles None (empty slot), str (bare whitespace stored by ruamel), and
+    CommentToken objects.  ``offset`` is the absolute column the subtree
+    originally started at; subtracting it realigns comments to column 0.
+    """
+    if token is None or isinstance(token, str):  # ruamel stores some slots as plain str
+        return
+    if hasattr(token, "start_mark") and token.start_mark is not None:
+        token.start_mark.column = max(0, token.start_mark.column - offset)
+    value = token.value
+    if isinstance(value, str) and "\n" in value:  # multi-line: fix embedded indentation
+        lines = value.split("\n")
+        adjusted: list[str] = []
+        for line in lines:
+            stripped = line.lstrip(" ")
+            indent = len(line) - len(stripped)
+            adjusted.append(" " * max(0, indent - offset) + stripped)
+        token.value = "\n".join(adjusted)
+
+
+def _adjust_comment_columns(node: Any, offset: int) -> None:
+    """Recursively shift CommentToken column positions by ``-offset``.
+
+    ruamel.yaml bakes absolute columns into CommentToken objects.  When a
+    subtree is re-serialized at column 0, code lines shift but comments don't.
+    This walk visits CommentedMap/CommentedSeq nodes (via ``ca``) and corrects
+    every token.  Block-scalar content (``|``/``>``) lives in scalar values,
+    not CommentTokens, so it is unaffected.
+    """
+    if offset <= 0:
+        return
+
+    if hasattr(node, "ca"):  # "ca" = ruamel CommentAttribute
+        ca = node.ca
+        if ca.comment:
+            _adjust_comment_token(ca.comment[0], offset)  # end-of-line comment
+            if len(ca.comment) > 1 and ca.comment[1]:
+                for tok in ca.comment[1]:  # block of preceding comments
+                    _adjust_comment_token(tok, offset)
+        for comments in ca.items.values():  # per-key/index comment tuples
+            for entry in comments:
+                if entry is None:
+                    continue
+                if isinstance(entry, list):  # slot holds multiple tokens
+                    for tok in entry:
+                        _adjust_comment_token(tok, offset)
+                else:
+                    _adjust_comment_token(entry, offset)
+        if ca.end:  # trailing comments after last child
+            for tok in ca.end:
+                _adjust_comment_token(tok, offset)
+
+    # Recurse into children: ca only holds comments for THIS node;
+    # nested dicts/lists have their own ca with their own tokens.
+    if isinstance(node, dict):
+        for v in node.values():
+            _adjust_comment_columns(v, offset)
+    elif isinstance(node, list):
+        for item in node:
+            _adjust_comment_columns(item, offset)
+
+
+class EditYAMLEntry:
+    """Provides manipulation interface to YAML files using direct writes
+    into YAML file, without regenerating the whole YAML content.
+    This allows to do minimal changes to YAML file and keep the YAML
+    diff as small as possible and keep custom indentation.
+
+    It supports inserting, replacing and deleting operations.
+
+    Functionality relays on ruamel.yaml parser ability, to provide "lc" line/column
+    attribute that points to the exact location of the objects in the YAML file.
+    Then exact line number range from to where should be content in file updated is
+    decided based on the location of the next element.
+    """
+
+    def __init__(self, yaml_file_path: Path, style: YAMLStyle | None = None):
+        """
+        :param yaml_file_path: path to the yaml file to be modified
+        :type yaml_file_path: Path
+        :param style: custom yaml style to be used for loading and generating
+                yaml files (None is default ruamel.yaml style)
+        :type style: YAMLStyle | None
+        """
+        self.yaml_file_path = yaml_file_path
+        self.style = style
+        self._data = None
+
+    @property
+    def data(self) -> Any:
+        """Loaded yaml data, cached property
+
+        :returns: YAML loaded data"""
+        if self._data is None:
+            self._data = load_yaml(self.yaml_file_path, self.style)
+        return self._data
+
+    @data.deleter
+    def data(self):
+        """Clear the cached YAML data so it is reloaded on next access."""
+        self._data = None
+
+    def invalidate_yaml_data(self):
+        """Invalidate loaded yaml data.
+        After each change to yaml file, data must be invalidated"""
+        del self.data
+
+    def _get_path_stack(self, path: YAMLPath, allow_scalar: bool = False) -> PathStack:
+        """Get path stack of the given path.
+        Each stack item consist of tuple (Node, index), where node is
+        yaml entry mapping(dict) or sequence(list) and index is str or int of the child
+        element in stack (index None means terminal node)
+
+        :param path: path to the yaml element in the yaml doc
+        :type path: YAMLPath
+        :param allow_scalar: if True, allows path to point to scalar values (non dict/list)
+        :type allow_scalar: bool
+        :returns: path stack representing path to each node on the path to the terminal node
+        """
+        path_stack: PathStack = []
+        current_data = self.data
+        for p in path:
+            assert isinstance(p, (int, str))
+            path_stack.append((current_data, p))
+            current_data = current_data[p]
+        if not isinstance(current_data, (CommentedMap, CommentedSeq)):
+            if not allow_scalar:
+                raise ValueError(
+                    f"Path must point to list/dict object. Given path {path} does not."
+                )
+            # For scalars, we don't add a terminal node - the last item in path_stack
+            # already points to the parent and the key/index of the scalar
+        else:
+            path_stack.append((current_data, None))  # terminal node
+        return path_stack
+
+    def insert(self, path: YAMLPath, data: Any):
+        """Insert data into mapping or sequence, parent node must be specified as path.
+
+        Insertion rules:
+        - Into dict: only dict values can be inserted
+        - Into list: any type (dict, list, scalar) can be inserted
+        - Into scalar: not supported
+
+        :param path: path in yaml, target object must be list or dict, not a scalar
+        :type path: YAMLPath
+        :param data: data to be injected into path (can be dict, list, or scalar)
+        :type data: Any
+        :raises ValueError: if insertion rules are violated
+        """
+        path_stack = self._get_path_stack(path)
+        last_node, _ = path_stack[-1]
+
+        # Validate insertion rules
+        if isinstance(last_node, dict):
+            # Into dict: only dict can be inserted
+            if not isinstance(data, dict):
+                raise ValueError(
+                    "Only dict values can be inserted into a dict. "
+                    f"Cannot insert {type(data).__name__} into dict."
+                )
+        elif isinstance(last_node, list):
+            # Into list: any type can be inserted (no restriction)
+            pass
+        else:
+            # Into anything else (scalar): not supported
+            raise ValueError(
+                f"Cannot insert into {type(last_node).__name__}. "
+                "Insertion is only supported for dict and list."
+            )
+
+        if is_flow_style_seq(last_node):
+            # we must update the parent via replacing
+            last_node = copy.deepcopy(last_node)
+            assert isinstance(last_node, (CommentedMap, CommentedSeq))
+            last_node.fa.set_block_style()
+            if isinstance(last_node, dict):
+                last_node.update(data)
+            else:
+                last_node.append(data)
+            return self.replace(path, last_node)
+
+        assert isinstance(last_node, (CommentedMap, CommentedSeq))
+        yaml_str = self._gen_yaml_str(data, last_node.lc.col, seq_block=isinstance(last_node, list))
+
+        # Appending as last item
+        lineno = -1  # if sibling doesn't exist, append at the end
+        next_entry_line = self._get_next_entry_line(path_stack)
+        if next_entry_line is not None:
+            # insert before the next entry
+            lineno = next_entry_line
+        insert_text_at_line(
+            self.yaml_file_path, lineno, yaml_str, validation_callback=post_test_yaml_validity
+        )
+        self.invalidate_yaml_data()
+
+    def replace(self, path: YAMLPath, data: Any):
+        """Replace existing sequence, mapping or scalar of the given path with the new data.
+
+        For scalars, the parent object is updated since scalars don't have line numbers.
+
+        :param path: path in yaml, can point to list, dict, or scalar value
+        :type path: YAMLPath
+        :param data: data to be replaced at path
+        :type data: Any
+        """
+        # try to get path stack, allowing scalars
+        path_stack = self._get_path_stack(path, allow_scalar=True)
+
+        # check if we're dealing with a scalar (no terminal node with None)
+        is_scalar = path_stack[-1][1] is not None
+
+        if is_scalar:
+            # for scalars, we need to update the parent object
+            if len(path_stack) < 1:
+                raise ValueError("Cannot replace root scalar value")
+
+            parent_node, scalar_key = path_stack[-1]
+
+            # update the parent with the new scalar value
+            parent_node = copy.deepcopy(parent_node)  # avoid reusing reference
+            parent_node[scalar_key] = data
+
+            # now replace the parent object
+            parent_path = path[:-1]
+            return self.replace(parent_path, parent_node)
+
+        last_node, _ = path_stack[-1]
+
+        if is_flow_style_seq(last_node):
+            path_stack, data = self._pre_process_flow_style_replace(path_stack, data)
+            # update last node to use new one
+            last_node, _ = path_stack[-1]
+            assert isinstance(last_node, (dict, list)) and hasattr(last_node, "lc")
+
+        # replacing at the same position
+        lineno = last_node.lc.line
+
+        # ensure we are not at the root element
+        col = last_node.lc.col
+        seq_block = False
+        if len(path_stack) > 1:
+            parent_node, _ = path_stack[-2]
+
+            if isinstance(parent_node, list):
+                seq_block = True
+                # by generating list item, it adds extra '- ', thus col is 2 less
+                col = max(0, col - 2)
+
+        yaml_str = self._gen_yaml_str(data, col, seq_block=seq_block)
+
+        # first we need to remove old content, that could be
+        # longer or shorter in matter of text lines
+        next_entry_line = self._get_next_entry_line(path_stack)
+        remove_lines_num = next_entry_line - lineno
+
+        insert_text_at_line(
+            self.yaml_file_path,
+            lineno,
+            yaml_str,
+            replace_lines=remove_lines_num,
+            validation_callback=post_test_yaml_validity,
+        )
+        self.invalidate_yaml_data()
+
+    def delete(self, path: YAMLPath):
+        """Delete existing sequence, mapping or scalar value of the given path.
+
+        For scalars, the key/index is removed from the parent object.
+        Empty items will be deleted by cascade.
+
+        :param path: path in yaml, can point to list, dict, or scalar value
+        :type path: YAMLPath
+        """
+        # try to get path stack, allowing scalars
+        path_stack = self._get_path_stack(path, allow_scalar=True)
+
+        # check if we're dealing with a scalar (no terminal node with None)
+        is_scalar = path_stack[-1][1] is not None
+
+        if is_scalar:
+            # for scalars, we need to delete the key/index from the parent object
+            if len(path_stack) < 1:
+                raise ValueError("Cannot delete root scalar value")
+
+            parent_node, scalar_key = path_stack[-1]
+
+            # delete the scalar from parent
+            parent_node = copy.deepcopy(parent_node)  # avoid reusing reference
+            del parent_node[scalar_key]
+
+            parent_path = path[:-1]
+            return self._delete_or_replace_parent(parent_node, parent_path)
+
+        path_stack = self._get_path_stack(path)
+
+        # if the entry is the only item of parent, remove also the parent
+        while len(path_stack) > 1:
+            parent_node, _ = path_stack[-2]
+            if len(parent_node) > 1:
+                break
+            path_stack.pop()
+        # drop terminal item, only terminal item can be None
+        path = [p for _, p in path_stack[:-1]]  # type: ignore
+
+        last_node, _ = path_stack[-1]
+
+        if is_flow_style_seq(last_node):
+            # we must update the parent via replacing
+            data: CommentedSeq | CommentedMap
+            if len(path_stack) > 1:
+                parent_node, parent_index = path_stack[-2]
+                path = path[:-1]  # instead of deleting item replace content of the parent
+                data = copy.deepcopy(parent_node)
+                data.fa.set_block_style()
+
+                del data[parent_index]
+            else:
+                # removing root node ?
+                data = CommentedMap()
+
+            return self.replace(path, data)
+
+        # removing from the node position
+        lineno = last_node.lc.line
+
+        # in case of preceding empty lines or comments, we have to remove them as well
+        if last_node.ca.comment and last_node.ca.comment[1]:
+            # getting first empty line/comment
+            lineno = last_node.ca.comment[1][0].start_mark.line
+
+        if self._is_parent_dict(path_stack):
+            parent_node, key = path_stack[-2]
+            if key is not None and self._is_first_key_in_seq_item(path_stack):
+                # Won't recurse further: this requires parent=dict in grandparent=list,
+                # but after one fallback the parent becomes the list, so it stops.
+                parent_node = copy.deepcopy(parent_node)
+                del parent_node[key]
+                parent_path = path[:-1]
+                return self._delete_or_replace_parent(parent_node, parent_path)
+            # to also remove dict key, we have to do -1 in lineno
+            lineno = max(lineno - 1, 0)
+
+        # remove old content till next element
+        next_entry_line = self._get_next_entry_line(path_stack)
+
+        if next_entry_line == EOF:
+            # last entry in the file, remove everything to EOF
+            remove_lines_num = EOF
+        elif last_node.ca.end:
+            # blank lines or comment lines exist after the node;
+            # preserve them by stopping before them
+            remove_lines_num = last_node.ca.end[0].start_mark.line - lineno
+        else:
+            # no trailing blank lines, remove up to the next entry
+            remove_lines_num = next_entry_line - lineno
+        remove_lines_from_file(
+            self.yaml_file_path,
+            lineno,
+            remove_lines_num,
+            validation_callback=post_test_yaml_validity,
+        )
+        self.invalidate_yaml_data()
+
+    def _delete_or_replace_parent(self, parent_node, parent_path):
+        """Cascade-delete if parent is now empty, otherwise replace it."""
+        if len(parent_node) == 0 and len(parent_path) > 0:
+            return self.delete(parent_path)
+        return self.replace(parent_path, parent_node)
+
+    def _is_parent_dict(self, path_stack: PathStack) -> bool:
+        """Return True if the parent node in the path stack is a dict."""
+        if len(path_stack) > 1:
+            parent, _ = path_stack[-2]
+            return isinstance(parent, dict)
+        return False
+
+    @staticmethod
+    def _is_first_key_in_seq_item(path_stack: PathStack) -> bool:
+        """Return True if the parent key (at path_stack[-2][1]) is the first key
+        of a mapping that is a sequence item."""
+        if len(path_stack) < 3:
+            return False
+        parent, key = path_stack[-2]
+        grandparent, _ = path_stack[-3]
+        return (
+            isinstance(parent, dict) and isinstance(grandparent, list) and next(iter(parent)) == key
+        )
+
+    def _get_next_entry_line(self, path_stack: PathStack) -> int:
+        """Find lineno where the next item in yaml starts.
+
+        Method looks for sibling item, if sibling doesn't exist
+        recursively check sibling of the parent.
+
+        IMPORTANT: this function works only with block style, make sure that
+        path stack points to the block style
+
+        :returns: line where next item in yaml file begins. EOF is returned when
+            no next entry is found, which means the last item in the path stack
+            is the last item in the yaml file.
+        :rtype: int
+        """
+        path_stack = copy.copy(path_stack)
+
+        def find_next_sibling_line(node, index) -> int | None:
+            """Return the line number of the next sibling, or None if no sibling exists."""
+            if isinstance(node, CommentedSeq):
+                assert isinstance(index, int)
+                if len(node) - 1 > index:
+                    return node[index + 1].lc.line  # sibling is just next item in array
+            elif isinstance(node, CommentedMap):
+
+                assert isinstance(index, str)
+                # we rely on python dict feature that ordering is kept
+                keys = tuple(node.keys())
+                key_idx = keys.index(index)
+                if len(keys) - 1 > key_idx:
+                    next_key = keys[key_idx + 1]
+                    line, _ = node.lc.key(next_key)
+                    return line
+
+            # other types cannot be used to find siblings
+            # sibling doesn't exist
+            return None
+
+        while path_stack:
+            current = path_stack.pop()
+            node, index = current
+            if index is None:
+                # terminal element, we cannot find sibling from this level
+                continue
+            sibling_line = find_next_sibling_line(node, index)
+            if sibling_line is None:
+                # sibling doesn't exist, continue to next level
+                continue
+
+            return sibling_line
+
+        return EOF
+
+    def _gen_yaml_str(self, data: Any, col: int, seq_block: bool = False) -> str:
+        """Generate an indented YAML string for the given data at the specified column.
+
+        Comment columns are pre-adjusted because ruamel.yaml bakes absolute
+        column positions into CommentToken objects. When a subtree loaded from
+        a parent is dumped in isolation, code lines are re-indented by the
+        emitter but comment positions are not, causing them to shift.
+        """
+        if col > 0:
+            data = copy.deepcopy(data)  # avoid mutating caller's comment metadata
+        if seq_block:
+            data = [data]
+        yaml = create_yaml_obj(style=self.style)
+        # The dump indents `- ` by sequence_dash_offset, which textwrap.dedent
+        # later strips from *all* lines including comments. Reduce the comment
+        # adjustment accordingly so the net result lands comments at their
+        # original column.
+        comment_offset = col
+        if seq_block:
+            comment_offset = max(0, col - yaml.sequence_dash_offset)
+        _adjust_comment_columns(data, comment_offset)
+        stream = StringIO()
+        yaml.dump(
+            data,
+            stream=stream,
+        )
+        yaml_output = stream.getvalue()
+
+        # with different yaml styles depending on exact yaml doc, ruamel.yaml may generate various
+        # indentation; we need to normalize it by dedent so col num can be used to do exact
+        # indentation as we need
+        # Note: we want to generate as close as possible to original doc style, so we cannot use
+        # our own style
+        dedented_yaml_output = textwrap.dedent(yaml_output)
+
+        # Indent each line of the YAML output by the column position
+        indented = textwrap.indent(dedented_yaml_output, " " * col)
+        return indented
+
+    def _pre_process_flow_style_replace(
+        self, path_stack, data: Any
+    ) -> tuple[PathStack, dict | list]:
+        """Flow style isn't fully supported, to comply with it, we will just use the yaml parser
+        to generate  the whole block since the first block style parent entry.
+        If first block is doc root, then everything will be regenerated.
+
+        Returns new path_stack to be used and data; If no change is needed,
+        original path_stack and data are returned
+
+        :param path_stack: current path stack pointing to the desired object
+        :type path_stack: PathStack
+        :param data: current data for replacement
+        :type data: Any
+        :returns: tuple that contains new path stack and new data to be used in replacement
+        """
+        if not path_stack:
+            return path_stack, data
+
+        if len(path_stack) < 2:
+            # no parent?
+            return path_stack, data
+
+        node, _ = path_stack[-1]
+        if not is_flow_style_seq(node):
+            return path_stack, data
+
+        # it's FLOW STYLE, yay!!
+        # update data first, we will use existing data to regenerate everything
+        # regenerate in BLOCK STYLE for future
+
+        # filthy data could sneak flow style into yaml
+        # reduce it by one level at least for future
+        if hasattr(data, "fa"):
+            data.fa.set_block_style()
+
+        path_stack = copy.copy(path_stack)
+
+        # update nodes with new data
+        # find first non-flow style parent, and replace it with block data
+        # as we cannot reliably update flow style data
+        while len(path_stack) > 1:
+            node, _ = path_stack[-1]
+            if not is_flow_style_seq(node):
+                break
+            parent, parent_idx = path_stack[-2]
+            path_stack.pop()
+            new_parent = copy.deepcopy(parent)
+            new_parent[parent_idx] = data
+            new_parent.fa.set_block_style()
+            data = new_parent
+
+        # mark new last node as terminal
+        node, _ = path_stack.pop()
+        path_stack.append((node, None))
+
+        return path_stack, data
+
+
+def post_test_yaml_validity(path):
+    """Validate if update yaml is valid
+
+    Given how this tool operates, it may happen that generated YAML isn't valid.
+    Rather fail early than provide false positive success.
+    """
+    try:
+        load_yaml(path)
+    except Exception as e:
+        raise RuntimeError("post-check: generated YAML is not valid") from e
+
+
+def remove_lines_from_file(
+    file_path: Path, start_line: int, num_lines: int, validation_callback=None
+) -> None:
+    """
+    Remove a block of text from a file without loading the entire file into memory.
+
+    :param file_path: Path to the file to modify
+    :type file_path: Path:
+    :param start_line: Line number where removal should start (0-indexed)
+    :type start_line: int
+    :param num_lines: Number of lines to remove (negative value mean till EOF)
+    :type num_lines: int
+
+    :raises FileNotFoundError: If the file doesn't exist
+    :raises ValueError: If start_line or num_lines are invalid
+    :raises IOError: If there's an error reading or writing the file
+    """
+    if start_line < 0:
+        raise ValueError("start_line must be >= 0")
+
+    if num_lines == 0:
+        return  # Nothing to remove
+
+    # start_line is already 0-indexed
+    start_index = start_line
+
+    end_index = start_index + num_lines
+    if num_lines < 0:  # till EOF
+        end_index = -1
+
+    # Create a temporary file in the same directory as the original
+    temp_dir = os.path.dirname(file_path) or "."
+    temp_fd, temp_path = tempfile.mkstemp(dir=temp_dir, text=True)
+
+    try:
+        with (
+            os.fdopen(temp_fd, "w", encoding="utf-8") as temp_file,
+            open(file_path, encoding="utf-8") as original_file,
+        ):
+            current_line = 0
+
+            for line in original_file:
+                # Copy lines before the removal range
+                if current_line < start_index:
+                    temp_file.write(line)
+                # Skip lines in the removal range
+                elif current_line < end_index or end_index < 0:  # till EOF
+                    pass  # Skip this line
+                # Copy lines after the removal range
+                else:
+                    temp_file.write(line)
+
+                current_line += 1
+
+            # Check if start_line was beyond the file length
+            if start_index >= current_line:
+                raise ValueError(
+                    f"start_line ({start_line}) is beyond the file "
+                    f"length (max index: {current_line - 1})"
+                )
+
+        if validation_callback is not None:
+            validation_callback(temp_path)
+
+        # Atomically replace the original file with the temporary file
+        os.replace(temp_path, file_path)
+
+    finally:
+        # Clean up temporary file
+        with contextlib.suppress(OSError):
+            os.unlink(temp_path)
+
+
+def insert_text_at_line(
+    file_path: Path,
+    line_number: int,
+    text_to_insert: str,
+    replace_lines: int = 0,
+    validation_callback=None,
+) -> None:
+    """
+    Insert or replace multiline text at a specified line number.
+
+    :param file_path: Path to the file to modify
+    :type file_path: Path
+    :param line_number: Line number where text should be inserted (0-indexed).
+                        Negative number means to append at the end of file.
+    :type line_number: int
+    :param text_to_insert: Text to insert or replace with (can be multiline)
+    :type text_to_insert: str
+    :param replace_lines: If positive value is defined replace
+                       a number of lines equal to the specified value.
+                       Negative value means to replace till EOF.
+                       (Default 0, no replacing)
+    :type replace_lines: int
+
+    :raises FileNotFoundError: If the file doesn't exist
+    :raises ValueError: If line_number is invalid
+    :raises IOError: If there's an error reading or writing the file
+    """
+    # line_number is already 0-indexed
+    insert_index = line_number
+
+    # Ensure text_to_insert ends with newline if it doesn't already
+    if text_to_insert is not None and not text_to_insert.endswith("\n"):
+        text_to_insert += "\n"
+
+    # Create a temporary file in the same directory as the original
+    temp_dir = os.path.dirname(file_path) or "."
+    temp_fd, temp_path = tempfile.mkstemp(dir=temp_dir, text=True)
+
+    try:
+        with (
+            os.fdopen(temp_fd, "w", encoding="utf-8") as temp_file,
+            open(file_path, encoding="utf-8") as original_file,
+        ):
+            current_line = 0
+            replacing_lines_in_progress = 0
+            last_line = ""
+
+            for line in original_file:
+                if replacing_lines_in_progress > 0:
+                    replacing_lines_in_progress -= 1
+                    current_line += 1
+                    continue
+
+                if current_line == insert_index:
+                    # Write the new text
+                    temp_file.write(text_to_insert)
+                    if replace_lines > 0:
+                        # one line is removed as part of this (with continue statement)
+                        replacing_lines_in_progress = replace_lines - 1
+                        current_line += 1
+                        continue
+                    elif replace_lines < 0:
+                        # replacing till EOF
+                        current_line += 1  # increase counter before break, so we don't insert again
+                        break
+
+                    temp_file.write(line)
+                else:
+                    # Copy the original line
+                    temp_file.write(line)
+
+                last_line = line
+                current_line += 1
+
+            # Handle case where line_number is beyond file length or insert_index is negative
+            # to append at the end file
+            if insert_index < 0 or current_line <= insert_index:
+                # When a file doesn't end with an empty line, insert one first
+                # to prevent creating invalid yaml
+                if last_line and not last_line.endswith("\n"):
+                    temp_file.write("\n")
+                temp_file.write(text_to_insert)
+
+        if validation_callback is not None:
+            validation_callback(temp_path)
+
+        # Atomically replace the original file with the temporary file
+        os.replace(temp_path, file_path)
+
+    finally:
+        # Clean up temporary file
+        with contextlib.suppress(OSError):
+            os.unlink(temp_path)

@@ -1,20 +1,64 @@
 name: Test
 on:
+  push:
+    branches: [main]
   pull_request:
     branches: [main]
 jobs:
-  run-tests:
-    name: run-tests
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 #v7.0.0
         with:
-          python-version: '3.13'
-      - run: |
-          python3 -m pip install -r requirements-test.txt
-          tox
+          python-version: "3.12"
+      - name: Install dependencies
+        run: make venv/create
+      - name: Run Black and Flake8
+        run: |
+          source .venv/bin/activate
+          tox -e black,flake8
+
+  type-check:
+    name: Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 #v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: make venv/create
+      - name: Run mypy
+        run: |
+          source .venv/bin/activate
+          tox -e mypy
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 #v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: make venv/create
+      - name: Run pytest via tox
+        run: |
+          source .venv/bin/activate
+          tox -e py312
       - name: Upload coverage reports to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+          flags: unit-tests
+          files: coverage.xml
+          fail_ci_if_error: false

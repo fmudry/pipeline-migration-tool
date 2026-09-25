@@ -3,6 +3,21 @@
 Pipeline migration tool is command line tool applying migrations for Konflux pipelines. It also
 allows to modify Konflux build pipelines locally.
 
+## Installation
+
+Install with pipx from the main branch:
+
+```bash
+pipx install git+https://github.com/konflux-ci/pipeline-migration-tool
+```
+
+Or, choose a version from [releases], for example:
+
+```bash
+pipx install https://github.com/konflux-ci/pipeline-migration-tool/archive/refs/tags/v0.5.0.tar.gz
+```
+
+
 ## Commands
 
 ### To apply migrations with `migrate`
@@ -21,11 +36,9 @@ typically with `oras attach`. Let's go deep dive a bit.
 * A task bundle has only one migration.
 * A migration is written as a normal Bash script. Generally, it invokes `yq` to modify the pipelines.
 
-Document [Task Migration]
-(https://github.com/konflux-ci/build-definitions/?tab=readme-ov-file#task-migration) of
-konflux-ci/build-definitions describes the migrations in detail. build-definitions provides a rich
-tool chain and CI for creation, validation and ensuring migrations are available to
-pipeline-migration-tool.
+Document [Task Migration] of konflux-ci/build-definitions describes the migrations in detail.
+build-definitions provides a rich tool chain and CI for creation, validation and ensuring migrations
+are available to pipeline-migration-tool.
 
 pipeline-migration-tool is configured in Konflux Mintmaker as a Renovate post-upgrade command and
 Renovate is responsible for invoke migration tool properly. Then, in general, it is unnecessary for
@@ -57,8 +70,7 @@ single task bundle upgrade, for example:
 ]
 ```
 
-The field names map to the [Renovate template fields]
-(https://docs.renovatebot.com/templates/#other-available-fields) directly:
+The field names map to the [Renovate template fields] directly:
 
 * `depName`: `{{depName}}`
 * `currentValue`: `{{currentValue}}`
@@ -71,16 +83,65 @@ The field names map to the [Renovate template fields]
 
 To generate the list, handlebars built-in `each` helper of Renovate is used.
 
-### Add a Konflux task to build pipeline with `add-task`
+### Manual task bundles updates
 
-Sub-command `add-task` provides rich options to add a Konflux task to build pipelines in local
+Use `--new-bundle` argument to do manual bundles updates:
+
+```bash
+pmt migrate \
+--new-bundle quay.io/konflux-ci/tekton-catalog/task-push-dockerfile-oci-ta:0.1@sha256:08bba4a659ecd48f871bef00b80af58954e5a09fcbb28a1783ddd640c4f6535e \
+--new-bundle quay.io/konflux-ci/tekton-catalog/task-init@sha256:4072de81ade0a75ad1eaa5449a7ff02bba84757064549a81b48c28fab3aeca59
+```
+
+`--new-bundle` accepts a full bundle reference with both tag and digest.
+
+By default, `migrate` searches Pipeline/PipelineRun YAML files from directory `.tekton/`. Alternatively, use `--pipeline-file` to specify a specific one.
+
+### Restricting image organizations with `--allowlist`
+
+Images must come from `quay.io`. Use `--allowlist` to further restrict which image repositories
+are accepted. Each value is **a glob pattern** matched against the image repository (Renovate
+`depName`): `*` matches within a single path segment (no `/`) and `**` matches any characters including `/`. The option
+can be specified multiple times. If omitted, all `quay.io` images are accepted.
+
+```bash
+pmt migrate -u '<upgrades>' \
+  --allowlist 'quay.io/konflux-ci/tekton-catalog/**' \
+  --allowlist 'quay.io/app-team/**'
+```
+
+In the above example, only images from `quay.io/konflux-ci/tekton-catalog/` and `quay.io/app-team/` are handled.
+Individual image repositories can also be specified:
+
+```bash
+pmt migrate -u '<upgrades>' --allowlist 'quay.io/konflux-ci/tekton-catalog/task-init'
+```
+
+> [!NOTE]
+> Use `**` to match any depth of sub-paths (e.g. `quay.io/konflux-ci/**`).
+> Use `*` to match a single path segment (e.g. `quay.io/konflux-ci/tekton-catalog/*`).
+> A pattern without wildcards matches only the exact image repository name.
+
+### Add a task to build pipeline with `add-task`
+
+Sub-command `add-task` provides rich options to add a task via bundle reference to build pipelines in local
 Component repositories. Let's take the task `sast-coverity-check` as an example to see a few
 command usages:
+
+> [!NOTE]
+> Tasks are added via bundle reference. For `quay.io`, you can provide just a tag, and the tool will automatically resolve the digest.
+> For all other registries, a full reference (tag + digest) is required.
+
+* Add task using a tag (digest is resolved automatically for quay.io):
+
+  ```bash
+  pmt add-task quay.io/konflux-ci/tekton-catalog/task-sast-coverity-check:0.1
+  ```
 
 * Add task with latest bundle to pipelines from inside a repository:
 
   ```bash
-  pmt add-task sast-coverity-check
+  pmt add-task quay.io/konflux-ci/tekton-catalog/task-sast-coverity-check:0.1@sha256:...
   ```
 
   where `./.tekton/` is the default location to search pipelines.
@@ -88,26 +149,250 @@ command usages:
 * Add task to multiple locations:
 
   ```bash
-  pmt add-task sast-coverity-check \
+  pmt add-task quay.io/konflux-ci/tekton-catalog/task-sast-coverity-check:0.1@sha256:... \
     /path/to/repo1/pipeline.yaml /path/to/repo2/pipeline-run.yaml ...
   ```
 
-* Specify alternative task bundle explicitly:
+* Specify an alternative name for the task configured in the pipeline:
 
   ```bash
-  pmt add-task --bundle-ref quay.io/konflux-ci/tekton-catalog/task-sast-coverity-check:0.1@sha256:... \
-    sast-coverity-check \
-    /path/to/repo1/pipeline.yaml /path/to/repo2/pipeline-run.yaml ...
+  pmt add-task quay.io/konflux-ci/tekton-catalog/task-sast-coverity-check:0.1@sha256:... \
+    /path/to/repo1/pipeline.yaml /path/to/repo2/pipeline-run.yaml ... \
+    --pipeline-task-name sast-coverity-check
   ```
 
 Get more information by `pmt add-task -h`
 
+### To modify Konflux pipelines with `modify`
+
+Sub-command `modify` provides rich options to modify existing pipeline/pipeline runs YAML files,
+mainly for automatic migrations.
+This command is designed to do as minimal as possible changes to the file,
+making the minimal git diff output, compared for example with `yq -i` command that may change
+the structure of the whole YAML file.
+
+pipeline-migration-tool (`pmt` command) is configured in Konflux Mintmaker to allow usage in migrations.
+
+* Example of adding new parameter:
+
+with yq (discouraged):
+
+```bash
+  yq -i "(.spec.tasks[] | select(.name == \"sast-coverity-check\")).params += \
+    [{\"name\": \"image-url\", \"value\": \"$image_url_value\"}]" "$pipeline_file"
+```
+
+the same with `pmt modify`:
+
+```bash
+  pmt modify -f "$pipeline_file" task sast-coverity-check add-param image-url "$image_url_value"
+```
+
+#### Dry-run
+
+`--dry-run` prints a unified diff of the changes that would be made and leaves
+the original pipeline file unchanged. It applies to all `modify` subcommands.
+
+```bash
+  pmt modify --dry-run -f "$pipeline_file" task sast-coverity-check add-param image-url "$image_url_value"
+```
+
+Get more information about supported resources by `pmt modify -h`, and supported commands
+for the given resource by `pmt modify RESOURCE -h` (for example `pmt modify task -h`).
+
+#### Modifying tasks
+
+The `pmt modify task` command contains a number of subcommands for specific task modifications. Some
+of those modifications are described below.
+
+##### rename
+
+The `rename` subcommand will rename a given task. It will also update all `runAfter` references to the
+task with the new task name. The optional parameter `--task-ref-name` sets the bundle name as well.
+
+```bash
+  pmt modify task old-name rename new-name
+```
+
+##### set-bundle
+
+The `set-bundle` subcommand will set the value of the bundle for the given task. Unlike `pmt-migrate`, the
+new bundle value does not have to share a repo and image name with the current bundle. The optional parameter
+`--task-ref-name` sets the bundle name as well
+
+```bash
+  pmt modify task old-task set-bundle quay.io/sample-repo/sample-bundle@sha256:a12c9... --task-ref-name bundle-name
+``` 
+
+#### Modifying pipelines
+
+The `pmt modify pipeline` command supports adding and removing pipeline-level parameters and results.
+
+##### add-param
+
+Add a parameter to the pipeline. If the parameter already exists, this is a no-op.
+The `--default` option is required (see [Limitations](#limitations)).
+
+```bash
+pmt modify pipeline add-param --default "" --description "Git repository URL" git-url
+```
+
+Options:
+- `--type`: Parameter type (`string` or `array`). Defaults to `string`.
+- `--description`: Parameter description. Defaults to an empty string. Multiline descriptions are
+  added as YAML literal strings.
+- `--default` (**required**): Default value. For array type, specify elements as a JSON array
+  (e.g. `'["val1","val2"]'`). An empty string `""` is interpreted as an empty array.
+
+##### remove-param
+
+Remove a parameter from the pipeline.
+
+```bash
+pmt modify pipeline remove-param git-url
+```
+
+##### add-result
+
+Add a result to the pipeline. If the result already exists, this is a no-op.
+
+```bash
+pmt modify pipeline add-result \
+    --description "Image digest" \
+    'IMAGE_DIGEST=$(tasks.build.results.IMAGE_DIGEST)'
+```
+
+For array results, the value can be a JSON array:
+
+```bash
+pmt modify pipeline add-result --type array \
+    'IMAGES=["$(tasks.foo.results.bar)","$(tasks.spam.results.egg)"]'
+```
+
+For object results, the value can be a JSON object:
+
+```bash
+pmt modify pipeline add-result --type object \
+    'BUILD_OUTPUT={"image_url":"$(tasks.build.results.IMAGE_URL)"}'
+```
+
+Options:
+- `--type`: Result type (`string`, `array`, or `object`). Defaults to `string`.
+- `--description`: Result description. Defaults to an empty string. Multiline descriptions are
+  added as YAML literal strings.
+
+##### remove-result
+
+Remove a result from the pipeline.
+
+```bash
+pmt modify pipeline remove-result IMAGE_DIGEST
+```
+
+#### Unsupported resource?
+
+When resource you need is not supported by `pmt modify` you can use `generic` subcommand
+which processes raw YAML text without semantic validation but tries to keep minimal changes
+done to the YAML file.
+
+It's not recommended to use this subcommand if specific resource subcommand exists.
+
+Sub-command `generic` supports following operations: `insert`, `replace`, and `remove`.
+
+Each operation requires a YAML path to the target item.
+Yaml path is sequence of indexes (compatible with `yq`'s `path` function):
+
+```yaml
+- spec
+- tasks
+- 5
+```
+
+Also singleline notation using YAML flow style can be used:`["spec", "tasks", 5]`.
+Item to be updated must be sequence or map type.
+
+Example using yq:
+```bash
+    pmt modify \\
+      -f .tekton/pr.yaml \\
+      generic remove \\
+      "$(yq '.spec.pipelineSpec.tasks[] | select(.name == "prefetch-dependencies") | \\
+         path' .tekton/pr.yaml)"
+```
+
+#### Limitations
+
+* **`add-param` requires `--default`**: The tool operates on individual files and cannot discover
+  separate `PipelineRun` files that reference a `Pipeline` via `pipelineRef`. A Tekton parameter
+  without a default is "required", meaning the `PipelineRun` must supply a value. Since the tool cannot
+  add values to referencing `PipelineRun` files, omitting the default would create an unsatisfied
+  required parameter. Requiring `--default` avoids this: a parameter with a default is never
+  "required" in Tekton, so no `PipelineRun` breaks from a missing value.
+
+#### Known issues
+
+Subcommand `modify` has following known issues
+
+* Indentation of inline comment may not be preserved when value on the same line us updated
+Example when value change:
+
+```yaml
+key: value  # comment
+```
+
+```yaml
+key: replaced-value      # comment
+```
+
+* YAML Flow style has limited support, to ensure safe modification,
+ flow style will be regenerated to block style on affected keys.
+
+For example, adding item `{"item": "test"}` into flow style list:
+
+```yaml
+---
+start:
+  flow: [{item: one, ...}, {item: two, ...}]
+```
+
+will result into:
+
+```yaml
+---
+start:
+  flow:
+  - {item: one, ...}
+  - {item: two, ...}
+  - item: test
+```
+
+## Development environment management
+
+* Create a virtual environment: `make venv/create`
+* Re-create the virtual environment: `make venv/recreate`
+* Update requirements after adding dependencies:
+  ```bash
+  source .venv/bin/activate
+  make deps/compile
+  ```
+* Upgrade dependencies:
+  ```bash
+  source .venv/bin/activate
+  make deps/upgrade
+  ```
+
+> [!NOTE]
+> If you create a virtual environment by yourself, please ensure create it with
+> python3.12 explicitly: `python3.12 -m venv .venv`
+>
+> When contributing dependency changes, open pull requests for adding and
+> upgrading dependencies separately.
+
 ## Run tests
 
 ```bash
-python3 -m venv venv
-source ./venv/bin/activate
-python3 -m pip install -r requirements-test.txt
+make venv/create
+source .venv/bin/activate
 tox
 ```
 
@@ -119,8 +404,7 @@ This integration test sets up a testing environment, inside which tasks are buil
 
 Prerequisite:
 
-- A local clone of [konflux-ci/build-definitions](https://github.com/konflux-ci/build-definitions) 
-  and checkout to `main` branch.
+- A local clone of [konflux-ci/build-definitions] and checkout to `main` branch.
 - Create public image repositories `task-clone` and `task-lint` under specified `QUAY_NAMESPACE`.
 - Log into Quay.io in order to make `tkn-bundle-push` work.
 
@@ -148,12 +432,15 @@ git checkout -b <test branch>  # setup.sh commits changes to the repo
 
 # Empty the image repositories of task-clone and task-lint
 
+# Log in to quay.io
+
+# For example, QUAY_NAMESPACE="mytestworkload" results in images like quay.io/mytestworkload/task-*
 BUILD_DEFS_REPO="<absolute path to build-definitions>" \
 QUAY_NAMESPACE="<quay namespace passed to build-definitions/hack/build-and-push.sh>" \
 ./hack/integration-test/setup.sh
 
 cd ./hack/integration-test/app
-PMT_LOCAL_TEST=1 pmt migrate -u "$(cat /tmp/pmt-test-upgrades.txt)"
+pmt migrate -u "$(cat /tmp/pmt-test-upgrades.txt)"
 
 # Check if the tool works as expected.
 ```
@@ -195,16 +482,14 @@ Follow these steps to make and publish a release. Here, version `0.4.2` is used 
 Done 🎉
 
 Then, Renovate will send an update pull request to [konflux-ci/mintmaker-renovate-image]
-(https://github.com/konflux-ci/mintmaker-renovate-image) automatically in order to upgrade
-pipeline-migration-tool to the new version.
+automatically in order to upgrade pipeline-migration-tool to the new version.
 
 Post-release steps:
 
 - It is highly recommend to link the Renovate update pull request to the release story.
 - If there is no release story for the new release, it can be optionally linked to the major feature
   or bugfix JIRA issue.
-- Open a pull request to MintMaker [Renovate configuration]
-  (https://github.com/konflux-ci/mintmaker/blob/main/config/renovate/renovate.json) when necessary
+- Open a pull request to MintMaker [Renovate configuration] when necessary
   to use new command line interface.
 
 ### Run script alternatively
@@ -236,3 +521,11 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+
+
+[releases]: https://github.com/konflux-ci/pipeline-migration-tool/releases
+[konflux-ci/mintmaker-renovate-image]: https://github.com/konflux-ci/mintmaker-renovate-image
+[Task Migration]: https://github.com/konflux-ci/build-definitions/?tab=readme-ov-file#task-migration
+[Renovate template fields]: https://docs.renovatebot.com/templates/#other-available-fields
+[Renovate configuration]: https://github.com/konflux-ci/mintmaker/blob/main/config/renovate/renovate.json
+[konflux-ci/build-definitions]: https://github.com/konflux-ci/build-definitions

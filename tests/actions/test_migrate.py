@@ -5,40 +5,58 @@ import logging
 import re
 import subprocess
 from copy import deepcopy
+from operator import attrgetter
 from pathlib import Path
 from typing import Any, Final
 from unittest.mock import patch
 
-from pipeline_migration.utils import YAMLStyle, dump_yaml, load_yaml
-import responses
 import pytest
+import responses
+from responses import matchers
 
-from pipeline_migration.actions import migrate
-from pipeline_migration.actions.migrate import (
+from pipeline_migration.actions.migrate import sandbox as migrate_sandbox
+from pipeline_migration.actions.migrate.models import (
+    PackageFile,
+    TaskBundleMigration,
+    TaskBundleUpgrade,
+)
+
+from pipeline_migration.actions.migrate.constants import (
     ANNOTATION_HAS_MIGRATION,
     ANNOTATION_IS_MIGRATION,
     ANNOTATION_TRUTH_VALUE,
-    MigrationApplyError,
-    determine_task_bundle_upgrades_range,
-    fetch_migration_file,
+    MIGRATION_IMAGE_TAG_LIKE_PATTERN,
+)
+from pipeline_migration.actions.migrate.exceptions import (
     IncorrectMigrationAttachment,
-    LinkedMigrationsResolver,
-    SimpleIterationResolver,
-    TaskBundleMigration,
-    TaskBundleUpgrade,
+    MigrationApplyError,
+    MigrationResolveError,
+)
+from pipeline_migration.actions.migrate.resolvers import (
+    determine_task_bundle_upgrades_range,
+    drop_out_of_order_versions,
+    list_bundle_tags,
+)
+from pipeline_migration.actions.migrate.resolvers.migration_images import (
+    MigrationImageTag,
+    MigrationImagesResolver,
+)
+from pipeline_migration.actions.migrate.main import (
     TaskBundleUpgradesManager,
     MigrationFileOperation,
-    PackageFile,
+    fetch_migration_file,
+    TransitionToModifyCommandOperation,
 )
+from pipeline_migration.actions.migrate.resolvers.simple import SimpleIterationResolver
+from pipeline_migration.actions.migrate.resolvers.linked_migrations import LinkedMigrationsResolver
 from pipeline_migration.quay import QuayTagInfo
 from pipeline_migration.registry import Container
-from tests.utils import generate_digest
-
+from pipeline_migration.utils import YAMLStyle, dump_yaml, load_yaml
+from tests.utils import generate_digest, generate_sha256sum, generate_timestamp
 
 # Tags are listed from the latest to the oldest one.
 SAMPLE_TAGS_OF_NS_APP: Final = [
     {"name": "0.3-0c9b02c", "manifest_digest": "sha256:bfc0c3c", "start_ts": 7},
-    # {"name": "0.3", "manifest_digest": "sha256:bfc0c3c"},
     {"name": "0.2-23d463f", "manifest_digest": "sha256:2a2c2b7", "start_ts": 6},
     {"name": "0.1-d4eab53", "manifest_digest": "sha256:52f8b96", "start_ts": 5},
     {"name": "0.1-b486c47", "manifest_digest": "sha256:9bfc6b9", "start_ts": 4},
@@ -287,7 +305,7 @@ RENOVATE_UPGRADES: list[dict[str, Any]] = [
         "parentDir": ".tekton/",
         "depTypes": ["tekton-bundle"],
     },
-    # for push
+    # for push. Both are reused by package files.
     {
         "depName": TASK_BUNDLE_CLONE,
         "currentValue": "0.1",
@@ -316,9 +334,91 @@ class TestTaskBundleUpgradesManagerCollectUpgrades:
     def setup_method(self, method):
         self.test_upgrades = deepcopy(RENOVATE_UPGRADES)
 
+    @staticmethod
+    def assert_bundle_upgrade_is_reused(manager: TaskBundleUpgradesManager):
+        """Esnure package file object reuses same bundle upgrade rather than a new object"""
+        for package_file in manager.package_files:
+            for bundle_upgrade in package_file.task_bundle_upgrades:
+                bundle_ref = bundle_upgrade.current_bundle
+                existing = manager._task_bundle_upgrades.get(bundle_ref)
+                msg = (
+                    f"Bundle upgrade {bundle_ref} belonging to PackageFile {package_file} "
+                    "does not exist in _task_bundle_upgrades."
+                )
+                assert existing, msg
+                msg = (
+                    f"Bundle upgrade {bundle_ref} exists in _task_bundle_upgrades, "
+                    f"but not reused in PackageFile object {package_file}"
+                )
+                assert id(existing) == id(bundle_upgrade), msg
+
     def test_collect_upgrades(self):
         manager = TaskBundleUpgradesManager(self.test_upgrades, SimpleIterationResolver)
-        assert len(manager._task_bundle_upgrades) == 3
+
+        dep_names = [item.dep_name for item in manager._task_bundle_upgrades.values()]
+        assert sorted(dep_names) == sorted([TASK_BUNDLE_CLONE, TASK_BUNDLE_TESTS, TASK_BUNDLE_LINT])
+
+        assert sorted(map(attrgetter("file_path"), manager.package_files)) == sorted(
+            [".tekton/component-a-pull-request.yaml", ".tekton/component-a-push.yaml"]
+        )
+
+        for package_file in manager.package_files:
+            match package_file.file_path:
+                case ".tekton/component-a-pull-request.yaml":
+                    dep_names = [item.dep_name for item in package_file.task_bundle_upgrades]
+                    assert sorted(dep_names) == sorted(
+                        [TASK_BUNDLE_CLONE, TASK_BUNDLE_TESTS, TASK_BUNDLE_LINT]
+                    )
+                case ".tekton/component-a-push.yaml":
+                    dep_names = [item.dep_name for item in package_file.task_bundle_upgrades]
+                    assert sorted(dep_names) == sorted([TASK_BUNDLE_CLONE, TASK_BUNDLE_TESTS])
+
+        self.assert_bundle_upgrade_is_reused(manager)
+
+
+class TestTaskBundleUpgradesManagerApplyMigrations:
+
+    @pytest.mark.parametrize(
+        "yaml_content",
+        [
+            pytest.param(
+                "apiVersion: tekton.dev/v1\nkind: Pipeline\n\tinvalid: value\n",
+                id="tab-in-yaml",
+            ),
+            pytest.param(
+                "[{' invalid --",
+                id="invalid-yaml",
+            ),
+            pytest.param(
+                "123",
+                id="not-a-dict",
+            ),
+            pytest.param(
+                "key: value\n",
+                id="not-a-pipeline",
+            ),
+        ],
+    )
+    def test_invalid_pipeline_file_logs_warning_and_debug_details(
+        self, yaml_content, tmp_path, caplog
+    ):
+        pipeline_file = tmp_path / "invalid.yaml"
+        pipeline_file.write_text(yaml_content)
+        upgrades = [
+            {
+                "depName": TASK_BUNDLE_CLONE,
+                "currentValue": "0.1",
+                "currentDigest": "sha256:abc",
+                "newValue": "0.2",
+                "newDigest": "sha256:def",
+                "packageFile": str(pipeline_file),
+            }
+        ]
+        manager = TaskBundleUpgradesManager(upgrades, SimpleIterationResolver)
+        assert [] == manager.apply_migrations(skip_bundles=[])
+
+        pattern = re.compile(r"Skipping .*file")
+        assert re.search(pattern, caplog.text)
 
 
 class TestFetchMigrationFile:
@@ -471,7 +571,8 @@ class TestResolveMigrations:
             return script_content
 
         monkeypatch.setattr(
-            "pipeline_migration.actions.migrate.fetch_migration_file", _fetch_migration_file
+            "pipeline_migration.actions.migrate.resolvers.simple.fetch_migration_file",
+            _fetch_migration_file,
         )
 
         manager.resolve_migrations()
@@ -493,6 +594,10 @@ class TestResolveMigrations:
 class TestMigrationFileOperationHandlePipelineFile:
     """Test MigrationFileOperation"""
 
+    @pytest.fixture(autouse=True)
+    def _disable_sandbox(self, monkeypatch):
+        monkeypatch.setattr(migrate_sandbox, "is_available", lambda: False)
+
     def prepare(self, tmp_path, pipeline_content):
         tb_upgrade = TaskBundleUpgrade(
             dep_name=TASK_BUNDLE_CLONE,
@@ -502,7 +607,7 @@ class TestMigrationFileOperationHandlePipelineFile:
             new_digest="sha256:96e797480ac5",
         )
 
-        self.package_file = PackageFile(file_path=".tekton/pipeline.yaml", parent_dir=".tekton")
+        self.package_file = PackageFile(file_path=".tekton/pipeline.yaml")
         self.package_file.task_bundle_upgrades.append(tb_upgrade)
 
         m = TaskBundleMigration(
@@ -594,7 +699,7 @@ class TestMigrationFileOperationHandlePipelineFile:
 
         monkeypatch.chdir(tmp_path)
         op = MigrationFileOperation(self.package_file.task_bundle_upgrades)
-        with patch.object(migrate, "dump_yaml", wraps=migrate.dump_yaml) as mock_dump_yaml:
+        with patch("pipeline_migration.actions.migrate.main.dump_yaml") as mock_dump_yaml:
             op.handle(self.package_file.file_path)
             assert mock_dump_yaml.call_count == expected_dump_yaml_calls
 
@@ -696,7 +801,7 @@ class TestLinkedMigrationsResolver:
             case "single":
                 # bundle@new_digest --> bundle@sha256:9bfc6b9 (M)
 
-                migration_bundle_digest: Final = "sha256:9bfc6b9"
+                migration_bundle_digest = "sha256:9bfc6b9"
 
                 c = Container(f"{tb_upgrade.dep_name}@{tb_upgrade.new_digest}")
                 mock_get_manifest(
@@ -1064,6 +1169,419 @@ def test_drop_out_of_order_versions(tags_info, bundle_upgrade, expected):
         json={"tags": [], "page": 1, "has_additional": False},
     )
 
-    tags = migrate.list_bundle_tags(bundle_upgrade)
-    result = migrate.drop_out_of_order_versions(tags, bundle_upgrade)
+    tags = list_bundle_tags(bundle_upgrade)
+    result = drop_out_of_order_versions(tags, bundle_upgrade)
     assert result == tuple(expected)
+
+
+next_ts = generate_timestamp()
+
+
+class TestMigrationImagesResolver:
+
+    @responses.activate
+    @pytest.mark.parametrize(
+        "tags",
+        [
+            pytest.param(
+                [{"name": f"migration-0.3-{generate_sha256sum()}-{next_ts()}-test"}],
+                id="no-expected-migration-tag-is-retrieved-from-registry",
+            ),
+            pytest.param([], id="migration-tag-is-not-present-in-registry"),
+        ],
+    )
+    def test_bundle_upgrade_does_not_have_migrations(self, tags):
+        c = Container(TASK_BUNDLE_CLONE)
+        api_url = f"https://quay.io/api/v1/repository/{c.api_prefix}/tag/"
+        tags = [
+            {"name": f"migration-0.3-{generate_sha256sum()}-{next_ts()}-test"},
+        ]
+        responses.get(
+            api_url,
+            json={"tags": tags, "page": 1, "has_additional": False},
+            match=[
+                matchers.query_param_matcher(
+                    {
+                        "page": "1",
+                        "onlyActiveTags": "true",
+                        "filter_tag_name": "like:" + MIGRATION_IMAGE_TAG_LIKE_PATTERN,
+                    },
+                )
+            ],
+        )
+
+        tb_upgrade = TaskBundleUpgrade(
+            dep_name=TASK_BUNDLE_CLONE,
+            current_value="0.1",
+            current_digest=generate_digest(),
+            new_value="0.3",
+            new_digest=generate_digest(),
+        )
+        resolver = MigrationImagesResolver()
+        resolver.resolve([tb_upgrade])
+
+        migration_scripts = [m.migration_script for m in tb_upgrade.migrations]
+        assert migration_scripts == []
+
+    @responses.activate
+    def test_fail_if_migration_is_modified(self):
+        c = Container(TASK_BUNDLE_CLONE)
+        api_url = f"https://quay.io/api/v1/repository/{c.api_prefix}/tag/"
+        responses.get(
+            api_url,
+            json={
+                "tags": [
+                    {"name": f"migration-0.2.1-{generate_sha256sum()}-{next_ts()}"},
+                    {"name": f"migration-0.2.1-{generate_sha256sum()}-{next_ts()}"},
+                ],
+                "page": 1,
+                "has_additional": False,
+            },
+            match=[
+                matchers.query_param_matcher(
+                    {
+                        "page": "1",
+                        "onlyActiveTags": "true",
+                        "filter_tag_name": "like:" + MIGRATION_IMAGE_TAG_LIKE_PATTERN,
+                    },
+                )
+            ],
+        )
+
+        tb_upgrade = TaskBundleUpgrade(
+            dep_name=TASK_BUNDLE_CLONE,
+            current_value="0.1",
+            current_digest=generate_digest(),
+            new_value="0.2",
+            new_digest=generate_digest(),
+        )
+        resolver = MigrationImagesResolver()
+        with pytest.raises(ExceptionGroup) as exc_info:
+            resolver.resolve([tb_upgrade])
+
+        assert exc_info.group_contains(
+            MigrationResolveError, match=r"Migration of task version 0.2.1 is modified."
+        )
+
+    @responses.activate
+    def test_migrations_are_resolved(self, mock_migration_images):
+        """Test resolver fetches expected migrations
+
+        Quay API listRepoTags is mocked with a set of migration image tags, which cover several
+        test cases:
+
+        * Out-of-order tags to ensure the migrations are stored internally in correct order sorted
+          by actual task version.
+        * Migrations are out of upgrade range, like migration-0.1 and migration-0.3.2.
+        * Tags are skipped due to the Unexpected tag form
+        * Repeatedly pushed migrations. Pick one from them .
+        """
+
+        sha256sum_0_2_1_sh = generate_sha256sum()
+        mock_migration_images(
+            TASK_BUNDLE_CLONE,
+            [
+                # This should be excluded.
+                {"name": f"migration-0.3.2-{generate_sha256sum()}-{next_ts()}"},
+                {"name": f"migration-0.2.1-{sha256sum_0_2_1_sh}-{next_ts()}"},
+                {"name": f"migration-0.2.1-{sha256sum_0_2_1_sh}-{next_ts()}"},
+                # This should be excluded.
+                {"name": f"migration-0.3-{generate_sha256sum()}-{next_ts()}-test"},
+                {"name": f"migration-0.3-{generate_sha256sum()}-{next_ts()}"},
+                # This should be excluded.
+                {"name": f"migration-0.1-{generate_sha256sum()}-{next_ts()}"},
+            ],
+        )
+
+        tb_upgrade = TaskBundleUpgrade(
+            dep_name=TASK_BUNDLE_CLONE,
+            current_value="0.1",
+            current_digest=generate_digest(),
+            new_value="0.3",
+            new_digest=generate_digest(),
+        )
+        resolver = MigrationImagesResolver()
+        resolver.resolve([tb_upgrade])
+
+        migration_scripts = [m.migration_script for m in tb_upgrade.migrations]
+        expected = ["echo 0.2.1", "echo 0.3"]
+        assert migration_scripts == expected
+
+    def test_no_migration_for_in_version_upgrade(self):
+        tb_upgrade = TaskBundleUpgrade(
+            dep_name=TASK_BUNDLE_CLONE,
+            current_value="0.3.2",
+            current_digest=generate_digest(),
+            new_value="0.3.2",
+            new_digest=generate_digest(),
+        )
+        resolver = MigrationImagesResolver()
+        resolver.resolve([tb_upgrade])
+
+        assert tb_upgrade.migrations == []
+
+    @responses.activate
+    def test_fail_if_migration_image_has_multiple_layers(self, mock_get_manifest_for_migration):
+        c = Container(TASK_BUNDLE_CLONE)
+        api_url = f"https://quay.io/api/v1/repository/{c.api_prefix}/tag/"
+        tags = [
+            {"name": f"migration-0.3-{generate_sha256sum()}-{next_ts()}"},
+        ]
+        responses.get(
+            api_url,
+            json={"tags": tags, "page": 1, "has_additional": False},
+            match=[
+                matchers.query_param_matcher(
+                    {
+                        "page": "1",
+                        "onlyActiveTags": "true",
+                        "filter_tag_name": "like:" + MIGRATION_IMAGE_TAG_LIKE_PATTERN,
+                    },
+                )
+            ],
+        )
+
+        # Mock for Registry.pull()
+        for tag in tags:
+            tag_name = tag["name"]
+            c = Container(f"{TASK_BUNDLE_CLONE}:{tag_name}")
+            migration_image_tag = MigrationImageTag.parse(tag_name)
+            if migration_image_tag is not None:
+                version = migration_image_tag.version
+                # make it fail
+                manifest_json = mock_get_manifest_for_migration(c, f"{version}.sh", True)
+                # Mock get_blob
+                blob_digest = manifest_json["layers"][0]["digest"]
+                responses.get(f"https://{c.get_blob_url(blob_digest)}", body=f"echo {version}")
+                blob_digest = manifest_json["layers"][1]["digest"]
+                responses.get(f"https://{c.get_blob_url(blob_digest)}", body="additional file")
+
+        tb_upgrade = TaskBundleUpgrade(
+            dep_name=TASK_BUNDLE_CLONE,
+            current_value="0.2.6",
+            current_digest=generate_digest(),
+            new_value="0.3",
+            new_digest=generate_digest(),
+        )
+        resolver = MigrationImagesResolver()
+        with pytest.raises(ExceptionGroup) as exc_info:
+            resolver.resolve([tb_upgrade])
+
+        assert exc_info.group_contains(
+            MigrationResolveError, match=r"Migration image [^ ]+ has multiple files:"
+        )
+
+
+MIGRATION_SCRIPT_SIMPLE_USE = """\
+#!/usr/bin/env bash
+pipeline=$1
+pmt modify -f "$pipeline" task build-container add-param param_200 value_200
+"""
+
+MIGRATION_SCRIPT_WITH_CUSTOM_PIPELINE_FILENAME = """\
+#!/usr/bin/env bash
+build_pipeline=$1
+pmt modify -f "$build_pipeline" task build-container add-param param_200 value_200
+"""
+
+MIGRATION_SCRIPT_PMT_MULTIPLE_LINES = """\
+#!/usr/bin/env bash
+pipeline=$1
+if [[ 1 == 1 ]]; then
+    pmt \
+        \
+        modify \
+        \
+        -f "$pipeline" \
+        task build-container \
+        add-param param_200 value_200
+fi
+"""
+
+MIGRATION_SCRIPT_USING_YQ = """\
+#!/usr/bin/env bash
+pipeline=$1
+yq -i "expression" "$pipeline"
+"""
+
+# Known issue
+MIGRATION_SCRIPT_MIX_YQ_PMT = """\
+#!/usr/bin/env bash
+pipeline=$1
+yq -i "expression" "$pipeline"
+pmt modify -f "$build_pipeline" task build-container \
+    add-param param_200 value_200
+"""
+
+MIGRATION_SCRIPT_IGNORE_COMMENTS = """\
+#!/usr/bin/env bash
+pipeline=$1
+yq -i "expression" "$pipeline"
+if [[ param not present ]]; then
+    # Using pmt modify -f "$build_pipeline" task build-container add-param param_200 value_200
+    yq -i "(.spec.tasks | select(...)).name |= new" "$pipeline_file"
+fi
+"""
+
+
+@pytest.mark.parametrize(
+    "script,expected",
+    [
+        (MIGRATION_SCRIPT_SIMPLE_USE, True),
+        (MIGRATION_SCRIPT_WITH_CUSTOM_PIPELINE_FILENAME, True),
+        (MIGRATION_SCRIPT_PMT_MULTIPLE_LINES, True),
+        (MIGRATION_SCRIPT_MIX_YQ_PMT, True),
+        (MIGRATION_SCRIPT_USING_YQ, False),
+        (MIGRATION_SCRIPT_IGNORE_COMMENTS, False),
+    ],
+)
+def test_detect_pmt_modify_use(script, expected):
+    tb_upgrade = TaskBundleUpgrade(
+        dep_name=TASK_BUNDLE_CLONE,
+        current_value="0.2.6",
+        current_digest=generate_digest(),
+        new_value="0.3",
+        new_digest=generate_digest(),
+        migrations=[TaskBundleMigration("", script)],
+    )
+    op = TransitionToModifyCommandOperation([tb_upgrade])
+    assert op._all_migrations_utilize_modify_cmd() == expected
+
+
+@pytest.mark.parametrize(
+    "pattern,path,expected",
+    [
+        pytest.param("quay.io/org/**", "quay.io/org/img", True, id="doublestar-end-one-segment"),
+        pytest.param(
+            "quay.io/org/**", "quay.io/org/sub/img", True, id="doublestar-end-multi-segments"
+        ),
+        pytest.param("quay.io/org/**", "quay.io/other/img", False, id="doublestar-end-no-match"),
+        pytest.param(
+            "quay.io/org/**/img", "quay.io/org/img", True, id="doublestar-mid-zero-segments"
+        ),
+        pytest.param(
+            "quay.io/org/**/img", "quay.io/org/sub/img", True, id="doublestar-mid-one-segment"
+        ),
+        pytest.param(
+            "quay.io/org/**/img",
+            "quay.io/org/a/b/img",
+            True,
+            id="doublestar-mid-multi-segments",
+        ),
+        pytest.param(
+            "quay.io/org/**/img", "quay.io/org/other", False, id="doublestar-mid-no-match"
+        ),
+        pytest.param("quay.io/org/*", "quay.io/org/img", True, id="single-star-matches"),
+        pytest.param("quay.io/org/*", "quay.io/org/sub/img", False, id="single-star-no-deep-match"),
+        pytest.param("quay.io/org/img", "quay.io/org/img", True, id="exact-match"),
+        pytest.param("quay.io/org/img", "quay.io/org/other", False, id="exact-no-match"),
+        pytest.param("quay.io/org/img-?", "quay.io/org/img-a", True, id="question-mark-one-char"),
+        pytest.param(
+            "quay.io/org/img-?", "quay.io/org/img-ab", False, id="question-mark-no-multi-char"
+        ),
+        pytest.param(
+            "quay.io/org/img-?", "quay.io/org/img-", False, id="question-mark-no-zero-char"
+        ),
+        pytest.param("**", "anything/at/all", True, id="match-everything"),
+        pytest.param("quay.io/**/sub/*", "quay.io/sub/img", True, id="combined-zero-mid-segments"),
+        pytest.param("quay.io/**/sub/*", "quay.io/a/sub/img", True, id="combined-one-mid-segment"),
+        pytest.param(
+            "quay.io/**/sub/*",
+            "quay.io/a/b/sub/img",
+            True,
+            id="combined-multi-mid-segments",
+        ),
+        pytest.param(
+            "quay.io/**/sub/*", "quay.io/a/sub/x/y", False, id="combined-star-no-deep-match"
+        ),
+        pytest.param("quay.io/org.name/*", "quay.io/org.name/img", True, id="dot-literal-match"),
+        pytest.param("quay.io/org.name/*", "quay.io/orgXname/img", False, id="dot-not-wildcard"),
+    ],
+)
+def test_glob_matching(pattern, path, expected):
+    from pipeline_migration.actions.migrate.main import is_allowed_image_repo
+
+    assert is_allowed_image_repo(path, [pattern]) == expected
+
+
+@pytest.mark.parametrize(
+    "image_repo,allowlist,expected",
+    [
+        pytest.param(
+            "quay.io/konflux-ci/catalog/task-clone",
+            ["quay.io/konflux-ci/**"],
+            True,
+            id="matches-konflux-prefix",
+        ),
+        pytest.param(
+            "reg.io/ns/app",
+            ["quay.io/konflux-ci/**"],
+            False,
+            id="no-match",
+        ),
+        pytest.param(
+            "quay.io/konflux-ci/catalog/task-clone",
+            ["reg.io/**", "quay.io/konflux-ci/**"],
+            True,
+            id="matches-second-pattern",
+        ),
+        pytest.param(
+            "reg.io/ns/app",
+            [],
+            False,
+            id="empty-allowlist",
+        ),
+        pytest.param(
+            "anything",
+            ["**"],
+            True,
+            id="wildcard-matches-all",
+        ),
+        pytest.param(
+            "quay.io/konflux-ci/tekton-catalog/task-init",
+            ["quay.io/konflux-ci/tekton-catalog/task-init"],
+            True,
+            id="matches-individual-image-repo",
+        ),
+        pytest.param(
+            "quay.io/konflux-ci/catalog/task-clone",
+            ["konflux-ci/**"],
+            False,
+            id="mid-string-pattern-does-not-match",
+        ),
+        pytest.param(
+            "quay.io/konflux-ci/catalog/task-clone",
+            ["quay.io/konflux-ci/**", "quay.io/other/**"],
+            True,
+            id="overlapping-patterns-first-matches",
+        ),
+        pytest.param(
+            "quay.io/konflux-ci-evil/task",
+            ["quay.io/konflux-ci/**"],
+            False,
+            id="glob-prevents-partial-org-match",
+        ),
+        pytest.param(
+            "quay.io/Konflux-CI/catalog/task",
+            ["quay.io/konflux-ci/**"],
+            False,
+            id="case-sensitive-no-match",
+        ),
+        pytest.param(
+            "quay.io/konflux-ci/catalog/task-clone",
+            ["quay.io/konflux-ci/catalog/*"],
+            True,
+            id="single-star-matches-one-segment",
+        ),
+        pytest.param(
+            "quay.io/konflux-ci/catalog/sub/task-clone",
+            ["quay.io/konflux-ci/catalog/*"],
+            False,
+            id="single-star-does-not-match-multiple-segments",
+        ),
+    ],
+)
+def test_is_allowed_image_repo(image_repo, allowlist, expected):
+    from pipeline_migration.actions.migrate.main import is_allowed_image_repo
+
+    assert is_allowed_image_repo(image_repo, allowlist) == expected
