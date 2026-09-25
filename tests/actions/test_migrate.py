@@ -14,6 +14,7 @@ import pytest
 import responses
 from responses import matchers
 
+from pipeline_migration.actions.migrate import sandbox as migrate_sandbox
 from pipeline_migration.actions.migrate.models import (
     PackageFile,
     TaskBundleMigration,
@@ -592,6 +593,10 @@ class TestResolveMigrations:
 
 class TestMigrationFileOperationHandlePipelineFile:
     """Test MigrationFileOperation"""
+
+    @pytest.fixture(autouse=True)
+    def _disable_sandbox(self, monkeypatch):
+        monkeypatch.setattr(migrate_sandbox, "is_available", lambda: False)
 
     def prepare(self, tmp_path, pipeline_content):
         tb_upgrade = TaskBundleUpgrade(
