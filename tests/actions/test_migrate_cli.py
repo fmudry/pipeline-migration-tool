@@ -16,6 +16,7 @@ import responses
 import pytest
 from oras.types import container_type
 
+from pipeline_migration.actions.migrate import sandbox as migrate_sandbox
 from pipeline_migration.cli import entry_point
 from pipeline_migration.actions.migrate.constants import (
     ANNOTATION_HAS_MIGRATION,
@@ -57,6 +58,11 @@ UPGRADES: Final = [
         "parentDir": ".tekton",
     },
 ]
+
+
+@pytest.fixture(autouse=True)
+def _disable_sandbox(monkeypatch):
+    monkeypatch.setattr(migrate_sandbox, "is_available", lambda: False)
 
 
 @dataclass

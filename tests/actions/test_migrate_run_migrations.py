@@ -9,11 +9,17 @@ import pytest
 import responses
 from ruamel.yaml import YAML
 
+from pipeline_migration.actions.migrate import sandbox as migrate_sandbox
 from pipeline_migration.cli import entry_point
 from pipeline_migration.pipeline import TEKTON_KIND_PIPELINE, TEKTON_KIND_PIPELINE_RUN
 from tests.actions.test_migrate import TASK_BUNDLE_CLONE
 from tests.actions.test_migrate_cli import mock_has_migration_images
 from tests.utils import generate_sha256sum, generate_timestamp
+
+
+@pytest.fixture(autouse=True)
+def _disable_sandbox(monkeypatch):
+    monkeypatch.setattr(migrate_sandbox, "is_available", lambda: False)
 
 
 @pytest.fixture(params=["pipeline", "pipeline_run"])
