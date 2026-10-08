@@ -3,6 +3,7 @@ from copy import deepcopy
 from textwrap import dedent
 from typing import Final
 from pathlib import Path
+from unittest.mock import patch
 import tempfile
 
 import responses
@@ -27,6 +28,12 @@ from pipeline_migration.registry import (
 )
 
 from tests.utils import generate_digest, RepoPath
+
+
+@pytest.fixture(autouse=True)
+def _disable_sandbox():
+    with patch("pipeline_migration.actions.migrate.sandbox.is_available", return_value=False):
+        yield
 
 
 @pytest.fixture
