@@ -213,26 +213,4 @@ def _build_mounts(migration_file: str, pipeline_file: str) -> list[dict]:
         },
     ]
 
-    resolv = "/etc/resolv.conf"
-    if os.path.exists(resolv):
-        mounts.append(
-            {
-                "destination": resolv,
-                "type": "bind",
-                "source": resolv,
-                "options": ["rbind", "ro"],
-            }
-        )
-
-    for ca_path in ("/etc/pki/tls/certs", "/etc/ssl/certs"):
-        if os.path.isdir(ca_path):
-            mounts.append(
-                {
-                    "destination": ca_path,
-                    "type": "bind",
-                    "source": ca_path,
-                    "options": ["rbind", "ro"],
-                }
-            )
-
     return mounts
