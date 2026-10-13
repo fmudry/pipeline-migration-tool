@@ -1,6 +1,8 @@
 import copy
 import contextlib
+import errno
 import os
+import shutil
 import tempfile
 import textwrap
 from pathlib import Path
@@ -582,6 +584,16 @@ def post_test_yaml_validity(path):
         raise RuntimeError("post-check: generated YAML is not valid") from e
 
 
+def _replace_file(temp_path: str, file_path: str | Path) -> None:
+    """Replace file_path with temp_path, falling back to copy on bind mounts."""
+    try:
+        os.replace(temp_path, file_path)
+    except OSError as e:
+        if e.errno != errno.EBUSY:
+            raise
+        shutil.copyfile(temp_path, str(file_path))
+
+
 def remove_lines_from_file(
     file_path: Path, start_line: int, num_lines: int, validation_callback=None
 ) -> None:
@@ -646,8 +658,7 @@ def remove_lines_from_file(
         if validation_callback is not None:
             validation_callback(temp_path)
 
-        # Atomically replace the original file with the temporary file
-        os.replace(temp_path, file_path)
+        _replace_file(temp_path, file_path)
 
     finally:
         # Clean up temporary file
@@ -741,8 +752,7 @@ def insert_text_at_line(
         if validation_callback is not None:
             validation_callback(temp_path)
 
-        # Atomically replace the original file with the temporary file
-        os.replace(temp_path, file_path)
+        _replace_file(temp_path, file_path)
 
     finally:
         # Clean up temporary file
