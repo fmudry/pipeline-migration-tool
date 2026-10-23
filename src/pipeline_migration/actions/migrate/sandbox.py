@@ -1,12 +1,19 @@
 """Container sandbox for running migration scripts via crun.
 
-When PMT_RUNNER_IMAGE is set (or crun/skopeo/umoci are available and
-PMT_SANDBOX is enabled), migration scripts execute inside an isolated OCI
-container built from a dedicated runner image. The container has its own
-filesystem (bash, pmt, yq, jq) and no access to host secrets. Network is
-shared so scripts can reach OCI registries.
+When crun, skopeo and umoci are available, migration scripts execute inside an isolated rootless
+OCI container built from a dedicated runner image (bash, pmt, yq, jq). The container has no
+access to host secrets. Network is shared so scripts can reach OCI registries.
 
-The runner image is pulled once per process lifetime and cached under /tmp.
+The container is built only from operations that an unprivileged process is always allowed to do,
+even under SELinux container_t, a masked /proc and the containers/common seccomp profile:
+user/mount/pid/ipc/uts namespaces, tmpfs mounts and bind mounts of directories PMT creates itself.
+Consequently there is no /proc inside the container, by design and in every environment.
+
+Migration scripts get a private, writable work directory /run/migration with script.sh and
+pipeline.yaml copies, so any way of rewriting the file (in place, rename, delete and recreate)
+works. The result is copied back to the original pipeline file afterwards.
+
+The runner image is pulled once and cached under /tmp.
 """
 
 import json
@@ -25,6 +32,8 @@ logger = logging.getLogger("migrate.sandbox")
 _CACHE_DIR = os.path.join(tempfile.gettempdir(), "pmt-runner")
 _READY_MARKER = ".ready"
 _DEFAULT_RUNNER_REPO = "quay.io/konflux-ci/pipeline-migration-runner"
+_HOST_RESOLV_CONF = "/etc/resolv.conf"
+_WORK_DIR = "/run/migration"
 
 
 def _get_runner_image() -> str:
@@ -56,13 +65,21 @@ def run_migration(
     container_id = f"pmt-{uuid.uuid4().hex[:12]}"
     bundle_dir = tempfile.mkdtemp(prefix="pmt-bundle-")
     state_dir = tempfile.mkdtemp(prefix="pmt-crun-")
+    work_dir = tempfile.mkdtemp(prefix="pmt-work-")
 
     try:
-        config = _build_config(
-            rootfs=rootfs,
-            migration_file=os.path.abspath(migration_file),
-            pipeline_file=os.path.abspath(pipeline_file),
-        )
+        shutil.copyfile(migration_file, os.path.join(work_dir, "script.sh"))
+        work_pipeline = os.path.join(work_dir, "pipeline.yaml")
+        shutil.copyfile(pipeline_file, work_pipeline)
+
+        resolv_conf = None
+        if os.path.isfile(_HOST_RESOLV_CONF):
+            # Copied rather than bind-mounted: the host file may carry an SELinux label that a
+            # container_t process is not allowed to mount.
+            resolv_conf = os.path.join(bundle_dir, "resolv.conf")
+            shutil.copyfile(_HOST_RESOLV_CONF, resolv_conf)
+
+        config = _build_config(rootfs=rootfs, work_dir=work_dir, resolv_conf=resolv_conf)
         with open(os.path.join(bundle_dir, "config.json"), "w") as f:
             json.dump(config, f)
 
@@ -82,10 +99,22 @@ def run_migration(
             total_ms - run_ms,
             result.returncode,
         )
+        if result.returncode != 0:
+            logger.error(
+                "Migration in container %s failed with output:\n%s",
+                container_id,
+                result.stdout.decode(errors="replace"),
+            )
+
+        if not os.path.isfile(work_pipeline):
+            raise RuntimeError(f"Migration script removed the pipeline file {pipeline_file}")
+        # Copy into the existing file to keep its inode, ownership and permissions
+        shutil.copyfile(work_pipeline, pipeline_file)
         return result
     finally:
         shutil.rmtree(bundle_dir, ignore_errors=True)
         shutil.rmtree(state_dir, ignore_errors=True)
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def _ensure_rootfs() -> str:
@@ -139,7 +168,7 @@ def _ensure_rootfs() -> str:
     return rootfs
 
 
-def _build_config(rootfs: str, migration_file: str, pipeline_file: str) -> dict:
+def _build_config(rootfs: str, work_dir: str, resolv_conf: str | None) -> dict:
     uid = os.getuid()
     gid = os.getgid()
 
@@ -148,20 +177,22 @@ def _build_config(rootfs: str, migration_file: str, pipeline_file: str) -> dict:
         "process": {
             "terminal": False,
             "user": {"uid": 0, "gid": 0},
-            "args": ["bash", "/run/migration/script.sh", "/run/migration/pipeline.yaml"],
+            "args": ["bash", f"{_WORK_DIR}/script.sh", f"{_WORK_DIR}/pipeline.yaml"],
             "env": [
                 "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                 "HOME=/root",
             ],
-            "cwd": "/",
+            "cwd": _WORK_DIR,
             "capabilities": {
                 t: [] for t in ["bounding", "effective", "inheritable", "permitted", "ambient"]
             },
             "noNewPrivileges": True,
         },
-        "root": {"path": rootfs},
-        "hostname": "migration-runner",
-        "mounts": _build_mounts(migration_file, pipeline_file),
+        # Read-only, so a migration cannot tamper with the cached rootfs used by later migrations
+        "root": {"path": rootfs, "readonly": True},
+        # No "hostname": crun would call sethostname(), which seccomp profiles such as the
+        # containers/common default deny without CAP_SYS_ADMIN. The uts namespace stays private.
+        "mounts": _build_mounts(work_dir, resolv_conf),
         "linux": {
             "uidMappings": [{"containerID": 0, "hostID": uid, "size": 1}],
             "gidMappings": [{"containerID": 0, "hostID": gid, "size": 1}],
@@ -176,41 +207,38 @@ def _build_config(rootfs: str, migration_file: str, pipeline_file: str) -> dict:
     }
 
 
-def _build_mounts(migration_file: str, pipeline_file: str) -> list[dict]:
-    mounts: list[dict] = [
-        {
-            "destination": "/dev",
-            "type": "tmpfs",
-            "source": "tmpfs",
-            "options": ["nosuid", "strictatime", "mode=755", "size=65536k"],
-        },
+def _tmpfs(destination: str, *options: str) -> dict:
+    return {
+        "destination": destination,
+        "type": "tmpfs",
+        "source": "tmpfs",
+        "options": list(options),
+    }
+
+
+def _build_mounts(work_dir: str, resolv_conf: str | None) -> list[dict]:
+    # No /proc: a fresh procfs mount is refused under SELinux container_t and when the parent
+    # /proc has masked paths, and bind-mounting the parent /proc would expose the environment
+    # (RENOVATE_TOKEN) of the Renovate process, which runs as the same UID.
+    #
+    # Device nodes (/dev/null, /dev/urandom, ...) are not bind-mounted here: crun creates the
+    # default OCI devices itself, while binding host device nodes is denied by SELinux when they
+    # carry host labels (e.g. null_device_t) and the caller runs as container_t.
+    mounts = [
+        _tmpfs("/dev", "nosuid", "strictatime", "mode=755", "size=65536k"),
+        _tmpfs("/dev/shm", "nosuid", "nodev", "noexec", "mode=1777", "size=65536k"),
+        _tmpfs("/tmp", "nosuid", "nodev", "mode=1777"),
+        _tmpfs("/root", "nosuid", "nodev", "mode=700"),
+        # A directory, not single-file bind mounts, so scripts can rename or recreate files
+        {"destination": _WORK_DIR, "type": "bind", "source": work_dir, "options": ["rbind", "rw"]},
     ]
-
-    for dev in ("/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"):
-        if os.path.exists(dev):
-            mounts.append(
-                {"destination": dev, "type": "bind", "source": dev, "options": ["rbind", "rw"]}
-            )
-
-    mounts += [
-        {
-            "destination": "/tmp",
-            "type": "tmpfs",
-            "source": "tmpfs",
-            "options": ["nosuid", "nodev", "mode=1777"],
-        },
-        {
-            "destination": "/run/migration/script.sh",
-            "type": "bind",
-            "source": migration_file,
-            "options": ["rbind", "ro"],
-        },
-        {
-            "destination": "/run/migration/pipeline.yaml",
-            "type": "bind",
-            "source": pipeline_file,
-            "options": ["rbind", "rw"],
-        },
-    ]
-
+    if resolv_conf:
+        mounts.append(
+            {
+                "destination": _HOST_RESOLV_CONF,
+                "type": "bind",
+                "source": resolv_conf,
+                "options": ["rbind", "ro"],
+            }
+        )
     return mounts
