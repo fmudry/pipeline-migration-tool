@@ -1,7 +1,7 @@
 """Container sandbox for running migration scripts via crun.
 
-When crun, skopeo and umoci are available, migration scripts execute inside an isolated rootless
-OCI container built from a dedicated runner image (bash, pmt, yq, jq). The container has no
+When crun and skopeo are available, migration scripts execute inside an isolated rootless OCI
+container built from a dedicated runner image (bash, pmt, yq, jq). The container has no
 access to host secrets. Network is shared so scripts can reach OCI registries.
 
 The container is built only from operations that an unprivileged process is always allowed to do,
@@ -13,7 +13,8 @@ Migration scripts get a private, writable work directory /run/migration with scr
 pipeline.yaml copies, so any way of rewriting the file (in place, rename, delete and recreate)
 works. The result is copied back to the original pipeline file afterwards.
 
-The runner image is pulled once and cached under /tmp.
+The runner image is pulled once with skopeo into an OCI image layout, unpacked into a rootfs by
+this module and cached under /tmp.
 """
 
 import json
@@ -21,6 +22,7 @@ import logging
 import os
 import shutil
 import subprocess as sp
+import tarfile
 import tempfile
 import time
 import uuid
@@ -35,6 +37,20 @@ _DEFAULT_RUNNER_REPO = "quay.io/konflux-ci/pipeline-migration-runner"
 _HOST_RESOLV_CONF = "/etc/resolv.conf"
 _WORK_DIR = "/run/migration"
 
+_IMAGE_MANIFEST_MEDIA_TYPES = {
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+}
+# Compressions tarfile can read. zstd is not supported by Python 3.12.
+_LAYER_MEDIA_TYPES = {
+    "application/vnd.oci.image.layer.v1.tar",
+    "application/vnd.oci.image.layer.v1.tar+gzip",
+    "application/vnd.docker.image.rootfs.diff.tar",
+    "application/vnd.docker.image.rootfs.diff.tar.gzip",
+}
+_WHITEOUT_PREFIX = ".wh."
+_OPAQUE_WHITEOUT = ".wh..wh..opq"
+
 
 def _get_runner_image() -> str:
     """Determine the runner image reference."""
@@ -46,7 +62,7 @@ def _get_runner_image() -> str:
 
 def is_available() -> bool:
     """Check whether containerized execution is available."""
-    for tool in ("crun", "skopeo", "umoci"):
+    for tool in ("crun", "skopeo"):
         if not shutil.which(tool):
             logger.debug("%s not found in PATH", tool)
             return False
@@ -128,7 +144,7 @@ def _ensure_rootfs() -> str:
 
     image = _get_runner_image()
     oci_dir = os.path.join(_CACHE_DIR, "oci")
-    bundle_dir = os.path.join(_CACHE_DIR, "bundle")
+    unpack_dir = os.path.join(_CACHE_DIR, "rootfs.tmp")
     os.makedirs(_CACHE_DIR, exist_ok=True)
 
     t0 = time.monotonic()
@@ -148,24 +164,128 @@ def _ensure_rootfs() -> str:
 
     t0 = time.monotonic()
     logger.info("Unpacking runner image")
-    sp.run(
-        ["umoci", "unpack", "--rootless", "--image", f"{oci_dir}:latest", bundle_dir],
-        check=True,
-        capture_output=True,
-    )
+    for path in (unpack_dir, rootfs):
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+    os.makedirs(unpack_dir)
+    unpack_oci_image(oci_dir, "latest", unpack_dir)
     unpack_ms = (time.monotonic() - t0) * 1000
 
-    unpacked_rootfs = os.path.join(bundle_dir, "rootfs")
-    if os.path.isdir(rootfs):
-        shutil.rmtree(rootfs)
-    os.rename(unpacked_rootfs, rootfs)
-
+    # Renamed into place only when complete, so an interrupted unpack is never used as a rootfs
+    os.rename(unpack_dir, rootfs)
     shutil.rmtree(oci_dir, ignore_errors=True)
-    shutil.rmtree(bundle_dir, ignore_errors=True)
 
     open(marker, "w").close()
     logger.info("Runner rootfs ready (pull: %.0fms, unpack: %.0fms)", pull_ms, unpack_ms)
     return rootfs
+
+
+def _read_blob(oci_dir: str, digest: str) -> str:
+    algorithm, _, encoded = digest.partition(":")
+    if not algorithm or not encoded or "/" in algorithm or "/" in encoded:
+        raise ValueError(f"Invalid blob digest: {digest}")
+    return os.path.join(oci_dir, "blobs", algorithm, encoded)
+
+
+def unpack_oci_image(oci_dir: str, ref_name: str, rootfs: str) -> None:
+    """Unpack an image from an OCI image layout into an existing empty rootfs directory.
+
+    Layers are applied in order, with OCI whiteouts handled as described in the OCI image spec.
+    No privileges are needed: files are owned by the current user, device nodes are skipped and
+    setuid/setgid bits are cleared.
+    """
+    with open(os.path.join(oci_dir, "index.json")) as f:
+        index = json.load(f)
+    descriptors = [
+        d
+        for d in index.get("manifests", [])
+        if d.get("annotations", {}).get("org.opencontainers.image.ref.name") == ref_name
+    ]
+    if len(descriptors) != 1:
+        raise ValueError(f"Expected one manifest tagged {ref_name} in {oci_dir}")
+    if descriptors[0].get("mediaType") not in _IMAGE_MANIFEST_MEDIA_TYPES:
+        raise ValueError(f"Unsupported manifest media type: {descriptors[0].get('mediaType')}")
+
+    with open(_read_blob(oci_dir, descriptors[0]["digest"])) as f:
+        manifest = json.load(f)
+    for layer in manifest["layers"]:
+        if layer.get("mediaType") not in _LAYER_MEDIA_TYPES:
+            raise ValueError(f"Unsupported layer media type: {layer.get('mediaType')}")
+        _apply_layer(_read_blob(oci_dir, layer["digest"]), rootfs)
+
+
+def _apply_layer(layer_path: str, rootfs: str) -> None:
+    rootfs = os.path.realpath(rootfs)
+    with tarfile.open(layer_path, "r:*") as tar:
+        members = tar.getmembers()
+        contents = []
+
+        # Whiteouts and replaced entries refer to lower layers only, so they are removed before
+        # anything from this layer is extracted, regardless of the order of entries in the tar.
+        for member in members:
+            dirname, basename = os.path.split(_member_path(member))
+            if basename == _OPAQUE_WHITEOUT:
+                directory = _rootfs_path(rootfs, dirname)
+                if os.path.isdir(directory) and not os.path.islink(directory):
+                    for entry in os.listdir(directory):
+                        _remove(os.path.join(directory, entry))
+            elif basename.startswith(_WHITEOUT_PREFIX):
+                # Other .wh..wh.* names are aufs metadata and have no meaning in the rootfs
+                if not basename.startswith(_WHITEOUT_PREFIX * 2):
+                    name = basename.removeprefix(_WHITEOUT_PREFIX)
+                    _remove(_rootfs_path(rootfs, os.path.join(dirname, name)))
+            else:
+                contents.append(member)
+                path = _rootfs_path(rootfs, _member_path(member))
+                # A directory merges with an existing directory, anything else replaces the entry
+                if not (member.isdir() and os.path.isdir(path) and not os.path.islink(path)):
+                    _remove(path)
+
+        tar.extractall(rootfs, members=contents, filter=_layer_filter)
+
+
+def _layer_filter(member: tarfile.TarInfo, dest_path: str) -> tarfile.TarInfo | None:
+    if member.ischr() or member.isblk() or member.isfifo():
+        # Creating device nodes needs CAP_MKNOD. crun creates the devices the container needs.
+        return None
+    if member.islnk():
+        # The "tar" filter does not check hard link targets
+        target = os.path.normpath(member.linkname.lstrip("/"))
+        if target == ".." or target.startswith("../"):
+            raise tarfile.LinkOutsideDestinationError(member, member.linkname)
+    # Strips leading slashes, refuses paths escaping dest_path, clears setuid/setgid and go-w
+    filtered = tarfile.tar_filter(member, dest_path)
+    if filtered.isdir():
+        # Owner write access lets later layers and cache cleanup modify the directory
+        filtered = filtered.replace(mode=filtered.mode | 0o700, deep=False)
+    return filtered
+
+
+def _member_path(member: tarfile.TarInfo) -> str:
+    path = os.path.normpath(member.name.lstrip("/"))
+    if path == ".." or path.startswith("../"):
+        raise tarfile.OutsideDestinationError(member, member.name)
+    return path
+
+
+def _rootfs_path(rootfs: str, path: str) -> str:
+    """Return the host path of a rootfs entry, refusing paths resolving outside the rootfs.
+
+    The parent directory is resolved because it may contain symlinks from lower layers. The entry
+    itself is not, so a symlink is removed rather than its target.
+    """
+    target = os.path.join(rootfs, path)
+    parent = os.path.realpath(os.path.dirname(target))
+    if os.path.commonpath([parent, rootfs]) != rootfs:
+        raise ValueError(f"Path {path} resolves outside of the rootfs")
+    return os.path.join(parent, os.path.basename(target))
+
+
+def _remove(path: str) -> None:
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    elif os.path.lexists(path):
+        os.unlink(path)
 
 
 def _build_config(rootfs: str, work_dir: str, resolv_conf: str | None) -> dict:
