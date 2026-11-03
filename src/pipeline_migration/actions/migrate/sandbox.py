@@ -37,6 +37,8 @@ _DEFAULT_RUNNER_REPO = "quay.io/konflux-ci/pipeline-migration-runner"
 _HOST_RESOLV_CONF = "/etc/resolv.conf"
 _WORK_DIR = "/run/migration"
 
+
+# QUESTION: Aren't either IMG. MANIFEST/LAYER MEDIA TYPES duplicated across the codebase?
 _IMAGE_MANIFEST_MEDIA_TYPES = {
     "application/vnd.oci.image.manifest.v1+json",
     "application/vnd.docker.distribution.manifest.v2+json",
@@ -48,7 +50,7 @@ _LAYER_MEDIA_TYPES = {
     "application/vnd.docker.image.rootfs.diff.tar",
     "application/vnd.docker.image.rootfs.diff.tar.gzip",
 }
-_WHITEOUT_PREFIX = ".wh."
+_WHITEOUT_PREFIX = ".wh."  # QUESTION: What are these?
 _OPAQUE_WHITEOUT = ".wh..wh..opq"
 
 
@@ -119,7 +121,7 @@ def run_migration(
             logger.error(
                 "Migration in container %s failed with output:\n%s",
                 container_id,
-                result.stdout.decode(errors="replace"),
+                result.stdout.decode(errors="replace"),  # QUESTION: what does replace do?
             )
 
         if not os.path.isfile(work_pipeline):
@@ -153,7 +155,7 @@ def _ensure_rootfs() -> str:
         [
             "skopeo",
             "copy",
-            "--remove-signatures",
+            "--remove-signatures",  # QUESTION: Why remove signatures?
             f"docker://{image}",
             f"oci:{oci_dir}:latest",
         ],
@@ -164,7 +166,7 @@ def _ensure_rootfs() -> str:
 
     t0 = time.monotonic()
     logger.info("Unpacking runner image")
-    for path in (unpack_dir, rootfs):
+    for path in (unpack_dir, rootfs):  # QUESTION: Why this for loop, what it does?
         if os.path.isdir(path):
             shutil.rmtree(path)
     os.makedirs(unpack_dir)
@@ -180,11 +182,11 @@ def _ensure_rootfs() -> str:
     return rootfs
 
 
-def _read_blob(oci_dir: str, digest: str) -> str:
+def _blob_path(oci_dir: str, digest: str) -> str:
     algorithm, _, encoded = digest.partition(":")
     if not algorithm or not encoded or "/" in algorithm or "/" in encoded:
         raise ValueError(f"Invalid blob digest: {digest}")
-    return os.path.join(oci_dir, "blobs", algorithm, encoded)
+    return os.path.join(oci_dir, "blobs", algorithm, encoded)  # QUESTION: What does this do? Why do it this way?
 
 
 def unpack_oci_image(oci_dir: str, ref_name: str, rootfs: str) -> None:
@@ -194,9 +196,9 @@ def unpack_oci_image(oci_dir: str, ref_name: str, rootfs: str) -> None:
     No privileges are needed: files are owned by the current user, device nodes are skipped and
     setuid/setgid bits are cleared.
     """
-    with open(os.path.join(oci_dir, "index.json")) as f:
+    with open(os.path.join(oci_dir, "index.json")) as f:  # QUESTION: Where does index.json come from?
         index = json.load(f)
-    descriptors = [
+    descriptors = [  # QUESTION: What are descriptors?
         d
         for d in index.get("manifests", [])
         if d.get("annotations", {}).get("org.opencontainers.image.ref.name") == ref_name
@@ -206,12 +208,12 @@ def unpack_oci_image(oci_dir: str, ref_name: str, rootfs: str) -> None:
     if descriptors[0].get("mediaType") not in _IMAGE_MANIFEST_MEDIA_TYPES:
         raise ValueError(f"Unsupported manifest media type: {descriptors[0].get('mediaType')}")
 
-    with open(_read_blob(oci_dir, descriptors[0]["digest"])) as f:
+    with open(_blob_path(oci_dir, descriptors[0]["digest"])) as f:
         manifest = json.load(f)
     for layer in manifest["layers"]:
         if layer.get("mediaType") not in _LAYER_MEDIA_TYPES:
             raise ValueError(f"Unsupported layer media type: {layer.get('mediaType')}")
-        _apply_layer(_read_blob(oci_dir, layer["digest"]), rootfs)
+        _apply_layer(_blob_path(oci_dir, layer["digest"]), rootfs)
 
 
 def _apply_layer(layer_path: str, rootfs: str) -> None:
@@ -224,7 +226,7 @@ def _apply_layer(layer_path: str, rootfs: str) -> None:
         # anything from this layer is extracted, regardless of the order of entries in the tar.
         for member in members:
             dirname, basename = os.path.split(_member_path(member))
-            if basename == _OPAQUE_WHITEOUT:
+            if basename == _OPAQUE_WHITEOUT:  # QUESTION: What are whiteouts and why don't we need them?
                 directory = _rootfs_path(rootfs, dirname)
                 if os.path.isdir(directory) and not os.path.islink(directory):
                     for entry in os.listdir(directory):
@@ -257,7 +259,7 @@ def _layer_filter(member: tarfile.TarInfo, dest_path: str) -> tarfile.TarInfo | 
     filtered = tarfile.tar_filter(member, dest_path)
     if filtered.isdir():
         # Owner write access lets later layers and cache cleanup modify the directory
-        filtered = filtered.replace(mode=filtered.mode | 0o700, deep=False)
+        filtered = filtered.replace(mode=filtered.mode | 0o700, deep=False)  # QUESTION: Could we make this more readable 0o700 might be confusing.
     return filtered
 
 
@@ -293,9 +295,9 @@ def _build_config(rootfs: str, work_dir: str, resolv_conf: str | None) -> dict:
     gid = os.getgid()
 
     return {
-        "ociVersion": "1.2.1",
+        "ociVersion": "1.2.1",  # QUESTION: why this version? Isn't there a newer one?
         "process": {
-            "terminal": False,
+            "terminal": False,  # QUESTION: what does this do?
             "user": {"uid": 0, "gid": 0},
             "args": ["bash", f"{_WORK_DIR}/script.sh", f"{_WORK_DIR}/pipeline.yaml"],
             "env": [
@@ -304,7 +306,7 @@ def _build_config(rootfs: str, work_dir: str, resolv_conf: str | None) -> dict:
             ],
             "cwd": _WORK_DIR,
             "capabilities": {
-                t: [] for t in ["bounding", "effective", "inheritable", "permitted", "ambient"]
+                t: [] for t in ["bounding", "effective", "inheritable", "permitted", "ambient"]  # QUESTION: What do these do and why do we need them?
             },
             "noNewPrivileges": True,
         },
@@ -338,7 +340,7 @@ def _tmpfs(destination: str, *options: str) -> dict:
 
 def _build_mounts(work_dir: str, resolv_conf: str | None) -> list[dict]:
     # No /proc: a fresh procfs mount is refused under SELinux container_t and when the parent
-    # /proc has masked paths, and bind-mounting the parent /proc would expose the environment
+    # /proc has masked paths and bind-mounting the parent /proc would expose the environment
     # (RENOVATE_TOKEN) of the Renovate process, which runs as the same UID.
     #
     # Device nodes (/dev/null, /dev/urandom, ...) are not bind-mounted here: crun creates the
@@ -346,8 +348,8 @@ def _build_mounts(work_dir: str, resolv_conf: str | None) -> list[dict]:
     # carry host labels (e.g. null_device_t) and the caller runs as container_t.
     mounts = [
         _tmpfs("/dev", "nosuid", "strictatime", "mode=755", "size=65536k"),
-        _tmpfs("/dev/shm", "nosuid", "nodev", "noexec", "mode=1777", "size=65536k"),
-        _tmpfs("/tmp", "nosuid", "nodev", "mode=1777"),
+        _tmpfs("/dev/shm", "nosuid", "nodev", "noexec", "mode=1777", "size=65536k"),  # QUESTION: what is /dev/shm? Why do we need it?
+        _tmpfs("/tmp", "nosuid", "nodev", "mode=1777"),  # QUESTION: we bind /tmp from the host, but where is the actual work of migration scipts done? Why do we mounht /tmp? Moreover, won't there be conflicts with the host /tmp?
         _tmpfs("/root", "nosuid", "nodev", "mode=700"),
         # A directory, not single-file bind mounts, so scripts can rename or recreate files
         {"destination": _WORK_DIR, "type": "bind", "source": work_dir, "options": ["rbind", "rw"]},
