@@ -650,7 +650,7 @@ class TestMigrationFileOperationHandlePipelineFile:
             # simulate yq to indent block sequences with 2 spaces
             style.indentation.indent(2)
             dump_yaml(pipeline_file, doc, style)
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
 
         monkeypatch.setattr("tempfile.mkstemp", _mkstemp)
         monkeypatch.setattr("subprocess.run", subprocess_run)
@@ -689,7 +689,7 @@ class TestMigrationFileOperationHandlePipelineFile:
         monkeypatch.setattr("tempfile.mkstemp", _mkstemp)
         monkeypatch.setattr(
             "subprocess.run",
-            lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+            lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b""),
         )
 
         monkeypatch.chdir(tmp_path)
@@ -715,7 +715,7 @@ class TestMigrationFileOperationHandlePipelineFile:
         def subprocess_run(cmd, *args, **kwargs):
             assert not kwargs.get("check")
             return subprocess.CompletedProcess(
-                cmd, 1, stdout="normal output\nerror: something is wrong"
+                cmd, 1, stdout=b"normal output\nerror: something is wrong"
             )
 
         monkeypatch.setattr("tempfile.mkstemp", _mkstemp)

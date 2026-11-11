@@ -18,6 +18,7 @@ from pipeline_migration.actions.migrate import sandbox
 from pipeline_migration.actions.migrate.constants import (
     ANNOTATION_IS_MIGRATION,
     MIGRATION_IMAGE_TAG_LIKE_PATTERN,
+    MIGRATION_TIMEOUT_SECONDS,
     SCHEMA_UPGRADE,
     logger,
 )
@@ -57,7 +58,7 @@ class MigrationFileOperation(PipelineFileOperation):
         fd, migration_file = tempfile.mkstemp(suffix="-migration-file")
         prev_size = 0
         errors: list[Exception] = []
-        use_sandbox = sandbox.is_available()
+        use_sandbox = sandbox.enabled()
 
         for bundle_upgrade in self._task_bundle_upgrades:
             for migration in bundle_upgrade.migrations:
@@ -75,12 +76,19 @@ class MigrationFileOperation(PipelineFileOperation):
                     prev_size = os.write(fd, content)
 
                     if use_sandbox:
-                        proc = sandbox.run_migration(migration_file, str(file_path))
+                        proc = sandbox.run_migration(
+                            migration_file, str(file_path), timeout=MIGRATION_TIMEOUT_SECONDS
+                        )
                     else:
                         cmd = ["bash", migration_file, str(file_path)]
                         logger.debug("Run: %r", cmd)
-                        proc = sp.run(cmd, stderr=sp.STDOUT, stdout=sp.PIPE)
-                    logger.debug("%r", proc.stdout)
+                        proc = sp.run(
+                            cmd,
+                            stderr=sp.STDOUT,
+                            stdout=sp.PIPE,
+                            timeout=MIGRATION_TIMEOUT_SECONDS,
+                        )
+                    _log_migration_output(proc)
                     proc.check_returncode()
                 except Exception as e:
                     err_msg = f"Failed to apply migration: {str(e)}"
@@ -135,6 +143,14 @@ class MigrationFileOperation(PipelineFileOperation):
             modified_pipeline = load_yaml(temp_pipeline_file, style=yaml_style)
             original_pipeline_doc["spec"]["pipelineSpec"] = modified_pipeline["spec"]
             dump_yaml(file_path, original_pipeline_doc, style=yaml_style)
+
+
+def _log_migration_output(proc: sp.CompletedProcess[bytes]) -> None:
+    output = proc.stdout.decode(errors="replace")
+    if proc.returncode == 0:
+        logger.debug("Migration script output:\n%s", output)
+    else:
+        logger.error("Migration script exited with code %d, output:\n%s", proc.returncode, output)
 
 
 class TransitionToModifyCommandOperation(MigrationFileOperation):
@@ -235,6 +251,10 @@ class TaskBundleUpgradesManager:
         """
         errors: list[Exception] = []
         processed_files: list[str] = []
+
+        # Decided before touching any file, so a broken sandbox fails the run once with a clear
+        # sandbox.SandboxError instead of failing every migration of every file
+        sandbox.enabled()
 
         for package_file in self.package_files:
             try:

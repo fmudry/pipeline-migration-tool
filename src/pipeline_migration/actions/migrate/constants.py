@@ -11,6 +11,9 @@ ANNOTATION_PREVIOUS_MIGRATION_BUNDLE: Final[str] = "dev.konflux-ci.task.previous
 
 ANNOTATION_TRUTH_VALUE: Final = "true"
 
+# Longest time a single migration script may run before it is killed
+MIGRATION_TIMEOUT_SECONDS: Final = 600
+
 # Example:  0.1-18a61693389c6c912df587f31bc3b4cc53eb0d5b
 TASK_TAG_REGEXP: Final = r"^[0-9.]+-[0-9a-f]+$"
 

@@ -15,6 +15,7 @@ from pipeline_migration.actions.migrate.constants import (
     ANNOTATION_TRUTH_VALUE,
     MIGRATION_IMAGE_TAG_LIKE_PATTERN,
 )
+from pipeline_migration.actions.migrate import sandbox
 from pipeline_migration.actions.migrate.resolvers.migration_images import MigrationImageTag
 from pipeline_migration.types import DescriptorT, ManifestT
 from pipeline_migration.registry import (
@@ -27,6 +28,18 @@ from pipeline_migration.registry import (
 )
 
 from tests.utils import generate_digest, RepoPath
+
+
+@pytest.fixture(autouse=True)
+def sandbox_off(monkeypatch):
+    """Run migration scripts on the host, whether or not crun and skopeo are installed.
+
+    Tests of the sandbox itself enable it explicitly.
+    """
+    monkeypatch.setenv(sandbox.SANDBOX_MODE_ENV, "off")
+    sandbox.enabled.cache_clear()
+    yield
+    sandbox.enabled.cache_clear()
 
 
 @pytest.fixture
