@@ -32,7 +32,7 @@ from tests.utils import generate_digest, RepoPath
 
 @pytest.fixture(autouse=True)
 def sandbox_off(monkeypatch):
-    """Run migration scripts on the host, whether or not crun and skopeo are installed.
+    """Run migration scripts on the host, whether or not crun and crane are installed.
 
     Tests of the sandbox itself enable it explicitly.
     """

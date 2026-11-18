@@ -20,8 +20,9 @@ Migration script contract inside the sandbox:
 - Only PATH and HOME are set. There is no /proc, so bash process substitution ``<(...)`` and
   /dev/stdin do not work.
 
-The runner image is pulled once with skopeo into an OCI image layout, unpacked into a rootfs by
-``oci_unpack`` and cached in a per-user directory under /tmp.
+The runner image is flattened into a single filesystem tarball by ``crane export``
+(go-containerregistry), which applies the layers and their whiteouts. The tarball is extracted into
+a rootfs cached in a per-user directory under /tmp.
 """
 
 import contextlib
@@ -32,6 +33,7 @@ import hashlib
 import json
 import logging
 import os
+import platform
 import shutil
 import stat
 import subprocess as sp
@@ -42,7 +44,6 @@ import uuid
 from collections.abc import Iterator
 
 from pipeline_migration import __version__
-from pipeline_migration.actions.migrate.oci_unpack import unpack_image
 
 logger = logging.getLogger("migrate.sandbox")
 
@@ -53,9 +54,9 @@ _MODE_ON = "on"
 _MODE_OFF = "off"
 
 _DEFAULT_RUNNER_REPO = "quay.io/konflux-ci/pipeline-migration-runner"
-# skopeo transports PMT_RUNNER_IMAGE may start with, e.g. "oci:/path/to/layout:tag" for tests
-_SKOPEO_TRANSPORTS = ("docker://", "oci:", "oci-archive:", "docker-archive:", "dir:")
 _PULL_TIMEOUT_SECONDS = 600
+# platform.machine() values that differ from the OCI architecture names
+_OCI_ARCHITECTURES = {"x86_64": "amd64", "aarch64": "arm64"}
 
 _READY_MARKER = ".ready"
 _HOST_RESOLV_CONF = "/etc/resolv.conf"
@@ -78,12 +79,12 @@ def enabled() -> bool:
 
     The decision is made once per process. The environment variable PMT_SANDBOX selects the policy:
 
-    - ``auto`` (default): use the sandbox when crun and skopeo are installed. Otherwise warn and
+    - ``auto`` (default): use the sandbox when crun and crane are installed. Otherwise warn and
       run migration scripts directly on the host.
     - ``on``: require the sandbox.
     - ``off``: never use the sandbox.
 
-    :raises SandboxError: the sandbox is required or crun and skopeo are installed, but the sandbox
+    :raises SandboxError: the sandbox is required or crun and crane are installed, but the sandbox
         cannot be prepared. Migrations never fall back to the host silently in that case.
     """
     mode = os.environ.get(SANDBOX_MODE_ENV, _MODE_AUTO).lower()
@@ -93,7 +94,7 @@ def enabled() -> bool:
         logger.info("Container sandbox disabled by %s=off", SANDBOX_MODE_ENV)
         return False
 
-    missing_tools = [tool for tool in ("crun", "skopeo") if not shutil.which(tool)]
+    missing_tools = [tool for tool in ("crun", "crane") if not shutil.which(tool)]
     if missing_tools:
         message = f"Container sandbox unavailable, {' and '.join(missing_tools)} not found in PATH"
         if mode == _MODE_ON:
@@ -215,10 +216,6 @@ def _get_runner_image() -> str:
     return os.environ.get(RUNNER_IMAGE_ENV) or f"{_DEFAULT_RUNNER_REPO}:v{__version__}"
 
 
-def _skopeo_source(image: str) -> str:
-    return image if image.startswith(_SKOPEO_TRANSPORTS) else f"docker://{image}"
-
-
 def _ensure_rootfs(image: str) -> str:
     """Return the cached rootfs of the runner image, pulling and unpacking it if needed."""
     cache_dir = _image_cache_dir(image)
@@ -239,52 +236,55 @@ def _is_ready(cache_dir: str) -> bool:
 
 
 def _build_rootfs(image: str, cache_dir: str) -> None:
-    """Pull and unpack the runner image. The caller holds the cache lock."""
-    oci_dir = os.path.join(cache_dir, "oci")
+    """Pull and extract the runner image. The caller holds the cache lock."""
+    tarball = os.path.join(cache_dir, "rootfs.tar")
     unpack_dir = os.path.join(cache_dir, "rootfs.tmp")
     rootfs = os.path.join(cache_dir, "rootfs")
 
     # Leftovers of an interrupted build, or a rootfs whose marker or content is missing
-    for leftover in (oci_dir, unpack_dir, rootfs):
+    for leftover in (unpack_dir, rootfs):
         shutil.rmtree(leftover, ignore_errors=True)
-    with contextlib.suppress(FileNotFoundError):
-        os.unlink(os.path.join(cache_dir, _READY_MARKER))
+    for leftover in (tarball, os.path.join(cache_dir, _READY_MARKER)):
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(leftover)
 
     started = time.monotonic()
     logger.info("Pulling runner image %s", image)
-    _pull_image(image, oci_dir)
-    pulled = time.monotonic()
-
-    logger.info("Unpacking runner image")
-    os.mkdir(unpack_dir)
     try:
-        unpack_image(oci_dir, "latest", unpack_dir)
-    except (ValueError, OSError, tarfile.TarError) as e:
-        raise SandboxError(f"Cannot unpack runner image {image}: {e}") from e
+        _export_image(image, tarball)
+        pulled = time.monotonic()
 
-    # Renamed into place only when complete, so an interrupted unpack is never used as a rootfs
+        logger.info("Extracting runner image")
+        os.mkdir(unpack_dir)
+        try:
+            with tarfile.open(tarball) as tar:
+                tar.extractall(unpack_dir, filter=_rootfs_filter)
+        except (OSError, tarfile.TarError) as e:
+            raise SandboxError(f"Cannot extract runner image {image}: {e}") from e
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tarball)
+
+    # Renamed into place only when complete, so an interrupted extraction is never used as a rootfs
     os.rename(unpack_dir, rootfs)
-    shutil.rmtree(oci_dir, ignore_errors=True)
     open(os.path.join(cache_dir, _READY_MARKER), "w").close()
     logger.info(
-        "Runner rootfs ready (pull: %.0fms, unpack: %.0fms)",
+        "Runner rootfs ready (pull: %.0fms, extract: %.0fms)",
         (pulled - started) * 1000,
         (time.monotonic() - pulled) * 1000,
     )
 
 
-def _pull_image(image: str, oci_dir: str) -> None:
+def _export_image(image: str, tarball: str) -> None:
+    """Write the flattened filesystem of the runner image to ``tarball`` with crane."""
+    machine = platform.machine()
     cmd = [
-        "skopeo",
-        "copy",
-        # The oci: layout cannot store signatures, so the copy fails without this when the source
-        # image has any
-        "--remove-signatures",
-        # Python's tarfile cannot read zstd layers
-        "--dest-compress-format",
-        "gzip",
-        _skopeo_source(image),
-        f"oci:{oci_dir}:latest",
+        "crane",
+        "export",
+        "--platform",
+        f"linux/{_OCI_ARCHITECTURES.get(machine, machine)}",
+        image,
+        tarball,
     ]
     try:
         sp.run(cmd, check=True, capture_output=True, timeout=_PULL_TIMEOUT_SECONDS)
@@ -295,6 +295,35 @@ def _pull_image(image: str, oci_dir: str) -> None:
         raise SandboxError(
             f"Pulling runner image {image} did not finish within {_PULL_TIMEOUT_SECONDS} seconds"
         ) from e
+
+
+def _rootfs_filter(member: tarfile.TarInfo, dest_path: str) -> tarfile.TarInfo | None:
+    """Extract the runner image without privileges and never outside the rootfs.
+
+    The "tar" filter refuses entries resolving outside ``dest_path`` (also through symlinks
+    extracted before) and clears setuid/setgid/sticky bits. The stricter "data" filter cannot be
+    used: it refuses absolute symlinks, which every distribution rootfs has.
+    """
+    if member.ischr() or member.isblk() or member.isfifo():
+        # Creating device nodes needs CAP_MKNOD. crun creates the devices the container needs.
+        return None
+    if member.islnk():
+        # The "tar" filter does not check hard link targets. A target reached through a symlink
+        # to a host file would link that file into the rootfs.
+        dest_path = os.path.realpath(dest_path)
+        linkname = member.linkname.lstrip("/")
+        target = os.path.realpath(os.path.join(dest_path, linkname))
+        if os.path.commonpath([target, dest_path]) != dest_path:
+            raise tarfile.LinkOutsideDestinationError(member, target)
+        member = member.replace(linkname=linkname, deep=False)
+
+    member = tarfile.tar_filter(member, dest_path)
+    # Owned by the current user, as if extracted with tar --no-same-owner
+    attributes: dict = {"uid": None, "gid": None, "uname": None, "gname": None}
+    if member.isdir() and member.mode is not None:
+        # Owner access lets cache cleanup remove the directory
+        attributes["mode"] = member.mode | stat.S_IRWXU
+    return member.replace(**attributes, deep=False)
 
 
 def _image_cache_dir(image: str) -> str:

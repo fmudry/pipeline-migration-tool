@@ -24,9 +24,6 @@ MEDIA_TYPE_OCI_IMAGE_INDEX_V1: Final = "application/vnd.oci.image.index.v1+json"
 MEDIA_TYPE_OCI_IMAGE_MANIFEST_V1: Final = "application/vnd.oci.image.manifest.v1+json"
 MEDIA_TYPE_OCI_IMAGE_LAYER_V1_TAR: Final = "application/vnd.oci.image.layer.v1.tar"
 MEDIA_TYPE_OCI_IMAGE_LAYER_V1_TAR_GZ: Final = "application/vnd.oci.image.layer.v1.tar+gzip"
-MEDIA_TYPE_DOCKER_IMAGE_MANIFEST_V2: Final = "application/vnd.docker.distribution.manifest.v2+json"
-MEDIA_TYPE_DOCKER_IMAGE_LAYER_TAR: Final = "application/vnd.docker.image.rootfs.diff.tar"
-MEDIA_TYPE_DOCKER_IMAGE_LAYER_TAR_GZ: Final = "application/vnd.docker.image.rootfs.diff.tar.gzip"
 
 
 @dataclass

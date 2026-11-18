@@ -1,6 +1,4 @@
-import hashlib
 import io
-import json
 import random
 import string
 import tarfile
@@ -45,7 +43,7 @@ def generate_timestamp():
 
 @dataclass
 class TarEntry:
-    """An entry of a test image layer. ``content`` is file data or the link target."""
+    """An entry of a test image tarball. ``content`` is file data or the link target."""
 
     name: str
     type: bytes = tarfile.REGTYPE
@@ -69,41 +67,9 @@ def hardlink_entry(name: str, target: str) -> TarEntry:
     return TarEntry(name, tarfile.LNKTYPE, target)
 
 
-def write_oci_layout(
-    oci_dir: Path,
-    layers: list[list[TarEntry]],
-    ref_name: str = "latest",
-    layer_media_type: str = "application/vnd.oci.image.layer.v1.tar+gzip",
-) -> None:
-    """Write a minimal OCI image layout with the given layers, as skopeo copy would."""
-    blobs = oci_dir / "blobs" / "sha256"
-    blobs.mkdir(parents=True)
-
-    def write_blob(data: bytes) -> dict:
-        digest = hashlib.sha256(data).hexdigest()
-        (blobs / digest).write_bytes(data)
-        return {"digest": f"sha256:{digest}", "size": len(data)}
-
-    layer_descriptors = [
-        {"mediaType": layer_media_type, **write_blob(_build_layer(entries))} for entries in layers
-    ]
-    manifest = {"schemaVersion": 2, "layers": layer_descriptors}
-    index = {
-        "schemaVersion": 2,
-        "manifests": [
-            {
-                "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                **write_blob(json.dumps(manifest).encode()),
-                "annotations": {"org.opencontainers.image.ref.name": ref_name},
-            }
-        ],
-    }
-    (oci_dir / "index.json").write_text(json.dumps(index))
-
-
-def _build_layer(entries: list[TarEntry]) -> bytes:
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+def write_tarball(path: Path, entries: list[TarEntry]) -> None:
+    """Write an uncompressed tarball with the given entries, as crane export would."""
+    with tarfile.open(path, mode="w") as tar:
         for entry in entries:
             info = tarfile.TarInfo(entry.name)
             info.type = entry.type
@@ -116,4 +82,3 @@ def _build_layer(entries: list[TarEntry]) -> bytes:
                 if isinstance(entry.content, str):
                     info.linkname = entry.content
                 tar.addfile(info)
-    return buf.getvalue()

@@ -3,6 +3,7 @@ import logging
 import os
 import stat
 import subprocess
+import tarfile
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
@@ -12,7 +13,14 @@ import pytest
 from pipeline_migration import __version__
 from pipeline_migration.actions.migrate import sandbox
 from pipeline_migration.actions.migrate.sandbox import SandboxError
-from tests.utils import file_entry, write_oci_layout
+from tests.utils import (
+    TarEntry,
+    dir_entry,
+    file_entry,
+    hardlink_entry,
+    symlink_entry,
+    write_tarball,
+)
 
 RUNNER_IMAGE = "quay.io/konflux-ci/pipeline-migration-runner:v1.0"
 
@@ -54,7 +62,7 @@ class TestEnabled:
     def test_on_requires_tools(self, monkeypatch):
         monkeypatch.setenv(sandbox.SANDBOX_MODE_ENV, "on")
         monkeypatch.setattr("shutil.which", lambda tool: None)
-        with pytest.raises(SandboxError, match="crun and skopeo not found"):
+        with pytest.raises(SandboxError, match="crun and crane not found"):
             sandbox.enabled()
 
     @pytest.mark.parametrize("mode", ["auto", "on"])
@@ -86,18 +94,6 @@ class TestRunnerImage:
     def test_override(self):
         assert sandbox._get_runner_image() == RUNNER_IMAGE
 
-    @pytest.mark.parametrize(
-        "image,source",
-        [
-            ("quay.io/org/runner:v1", "docker://quay.io/org/runner:v1"),
-            ("localhost:5000/runner:v1", "docker://localhost:5000/runner:v1"),
-            ("oci:/path/layout:tag", "oci:/path/layout:tag"),
-            ("docker://quay.io/org/runner:v1", "docker://quay.io/org/runner:v1"),
-        ],
-    )
-    def test_skopeo_source(self, image, source):
-        assert sandbox._skopeo_source(image) == source
-
 
 class TestCache:
 
@@ -123,57 +119,59 @@ class TestCache:
         assert sandbox._image_cache_dir("a:v1") != sandbox._image_cache_dir("a:v2")
 
 
-class FakeSkopeo:
-    """Stands in for subprocess.run: "pulls" an image by writing an OCI layout."""
+class FakeCrane:
+    """Stands in for subprocess.run: "exports" an image by writing a filesystem tarball."""
 
-    def __init__(self, returncode: int = 0, stderr: bytes = b""):
+    def __init__(self, returncode: int = 0, stderr: bytes = b"", entries=None):
         self.returncode = returncode
         self.stderr = stderr
+        self.entries = entries or [file_entry("usr/bin/yq", b"yq")]
         self.calls: list[list[str]] = []
 
     def __call__(self, cmd, **kwargs):
-        assert cmd[:2] == ["skopeo", "copy"]
+        assert cmd[:2] == ["crane", "export"]
         assert kwargs["timeout"] > 0
         self.calls.append(cmd)
         if self.returncode:
             raise subprocess.CalledProcessError(self.returncode, cmd, b"", self.stderr)
-        oci_dir = cmd[-1].removeprefix("oci:").removesuffix(":latest")
-        write_oci_layout(Path(oci_dir), [[file_entry("usr/bin/yq", b"yq")]])
+        write_tarball(Path(cmd[-1]), self.entries)
         return subprocess.CompletedProcess(cmd, 0, b"", b"")
 
 
 class TestEnsureRootfs:
 
-    def test_pull_and_unpack(self, monkeypatch):
-        skopeo = FakeSkopeo()
-        monkeypatch.setattr(sandbox.sp, "run", skopeo)
+    def test_pull_and_extract(self, monkeypatch):
+        crane = FakeCrane()
+        monkeypatch.setattr(sandbox.sp, "run", crane)
+        monkeypatch.setattr(sandbox.platform, "machine", lambda: "x86_64")
         rootfs = Path(sandbox._ensure_rootfs(RUNNER_IMAGE))
 
         assert (rootfs / "usr/bin/yq").read_bytes() == b"yq"
+        # The exported tarball is removed
         assert sorted(os.listdir(rootfs.parent)) == [".lock", ".ready", "rootfs"]
-        cmd = skopeo.calls[0]
-        assert f"docker://{RUNNER_IMAGE}" in cmd
-        assert cmd[cmd.index("--dest-compress-format") + 1] == "gzip"
+        cmd = crane.calls[0]
+        assert cmd[-2] == RUNNER_IMAGE
+        assert cmd[cmd.index("--platform") + 1] == "linux/amd64"
 
     def test_cached_rootfs_is_reused(self, monkeypatch):
-        skopeo = FakeSkopeo()
-        monkeypatch.setattr(sandbox.sp, "run", skopeo)
+        crane = FakeCrane()
+        monkeypatch.setattr(sandbox.sp, "run", crane)
         sandbox._ensure_rootfs(RUNNER_IMAGE)
         sandbox._ensure_rootfs(RUNNER_IMAGE)
-        assert len(skopeo.calls) == 1
+        assert len(crane.calls) == 1
 
     def test_deleted_rootfs_is_rebuilt(self, monkeypatch):
-        skopeo = FakeSkopeo()
-        monkeypatch.setattr(sandbox.sp, "run", skopeo)
+        crane = FakeCrane()
+        monkeypatch.setattr(sandbox.sp, "run", crane)
         rootfs = Path(sandbox._ensure_rootfs(RUNNER_IMAGE))
         sandbox.shutil.rmtree(rootfs)
         sandbox._ensure_rootfs(RUNNER_IMAGE)
-        assert len(skopeo.calls) == 2
+        assert len(crane.calls) == 2
         assert (rootfs / "usr/bin/yq").exists()
 
-    def test_pull_failure_reports_skopeo_error(self, monkeypatch):
-        monkeypatch.setattr(sandbox.sp, "run", FakeSkopeo(1, b"manifest unknown"))
-        with pytest.raises(SandboxError, match="Cannot pull runner image .+: manifest unknown"):
+    def test_pull_failure_reports_crane_error(self, monkeypatch):
+        monkeypatch.setattr(sandbox.sp, "run", FakeCrane(1, b"MANIFEST_UNKNOWN"))
+        with pytest.raises(SandboxError, match="Cannot pull runner image .+: MANIFEST_UNKNOWN"):
             sandbox._ensure_rootfs(RUNNER_IMAGE)
         assert not sandbox._is_ready(sandbox._image_cache_dir(RUNNER_IMAGE))
 
@@ -184,6 +182,81 @@ class TestEnsureRootfs:
         monkeypatch.setattr(sandbox.sp, "run", hang)
         with pytest.raises(SandboxError, match="did not finish"):
             sandbox._ensure_rootfs(RUNNER_IMAGE)
+
+    def test_extraction_failure(self, monkeypatch):
+        crane = FakeCrane(entries=[hardlink_entry("bin/x", "../outside")])
+        monkeypatch.setattr(sandbox.sp, "run", crane)
+        with pytest.raises(SandboxError, match="Cannot extract runner image"):
+            sandbox._ensure_rootfs(RUNNER_IMAGE)
+        cache_dir = sandbox._image_cache_dir(RUNNER_IMAGE)
+        assert not sandbox._is_ready(cache_dir)
+        assert "rootfs.tar" not in os.listdir(cache_dir)
+
+
+class TestExtraction:
+    """The rootfs filter applied to the tarball exported by crane."""
+
+    @pytest.fixture
+    def host_dir(self, tmp_path) -> Path:
+        path = tmp_path / "host"
+        path.mkdir()
+        (path / "secret").write_text("RENOVATE_TOKEN=abc")
+        return path
+
+    @pytest.fixture
+    def extract(self, tmp_path) -> Callable[[list[TarEntry]], Path]:
+        def _extract(entries: list[TarEntry]) -> Path:
+            tarball = tmp_path / "rootfs.tar"
+            rootfs = tmp_path / "rootfs"
+            rootfs.mkdir()
+            write_tarball(tarball, entries)
+            with tarfile.open(tarball) as tar:
+                tar.extractall(rootfs, filter=sandbox._rootfs_filter)
+            return rootfs
+
+        return _extract
+
+    def test_files_directories_and_links(self, extract):
+        rootfs = extract(
+            [
+                # Upper layers come first in crane's output, so a file may precede its directory
+                file_entry("usr/bin/bash", b"bash", 0o755),
+                dir_entry("usr/bin", 0o555),
+                symlink_entry("bin", "usr/bin"),
+                symlink_entry("etc/alternatives/python", "/usr/bin/python3.12"),
+                hardlink_entry("usr/bin/sh", "/usr/bin/bash"),
+            ]
+        )
+        assert (rootfs / "bin/bash").read_bytes() == b"bash"
+        assert os.readlink(rootfs / "etc/alternatives/python") == "/usr/bin/python3.12"
+        assert (rootfs / "usr/bin/sh").stat().st_ino == (rootfs / "usr/bin/bash").stat().st_ino
+        # Owner access is added so the cache can be removed
+        assert stat.S_IMODE((rootfs / "usr/bin").stat().st_mode) == 0o755
+
+    def test_device_nodes_are_skipped(self, extract):
+        rootfs = extract(
+            [TarEntry("dev/null", tarfile.CHRTYPE), TarEntry("run/fifo", tarfile.FIFOTYPE)]
+        )
+        assert not (rootfs / "dev/null").exists()
+        assert not (rootfs / "run/fifo").exists()
+
+    def test_privileged_mode_bits_are_cleared(self, extract):
+        rootfs = extract([file_entry("usr/bin/su", b"su", 0o4777)])
+        assert stat.S_IMODE((rootfs / "usr/bin/su").stat().st_mode) == 0o755
+
+    def test_file_through_absolute_symlink_is_refused(self, extract, host_dir):
+        with pytest.raises(tarfile.OutsideDestinationError):
+            extract([symlink_entry("home", str(host_dir)), file_entry("home/planted")])
+        assert os.listdir(host_dir) == ["secret"]
+
+    @pytest.mark.parametrize("link", ["../host/secret", "/../host/secret"])
+    def test_escaping_hard_link_is_refused(self, extract, link):
+        with pytest.raises(tarfile.LinkOutsideDestinationError):
+            extract([hardlink_entry("stolen", link)])
+
+    def test_hard_link_through_symlink_to_host_is_refused(self, extract, host_dir):
+        with pytest.raises(tarfile.LinkOutsideDestinationError):
+            extract([symlink_entry("x", str(host_dir)), hardlink_entry("stolen", "x/secret")])
 
 
 Script = Callable[[Path], int]
