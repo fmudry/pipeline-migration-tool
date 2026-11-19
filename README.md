@@ -414,6 +414,19 @@ e.g. `(pmt API version 2)` or `(pmt API version 1, default)`. When `pmt` is run 
 `PMT_API_VERSION=2 pmt task ...` in a terminal, it logs the API version it uses and where it comes
 from: `Using CLI API version 2 (set by PMT_API_VERSION)`.
 
+#### Operations available only in API version 2
+
+##### remove-matrix
+
+Remove the whole `matrix` block from a task, together with everything it contains, such as its
+`params`. If the task has no matrix, this is a no-op.
+
+```bash
+PMT_API_VERSION=2 pmt task -f "$pipeline_file" -n clair-scan remove-matrix
+```
+
+To remove a single matrix parameter, use `remove-matrix-param` instead.
+
 ## Development environment management
 
 * Create a virtual environment: `make venv/create`
