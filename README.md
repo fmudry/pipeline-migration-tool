@@ -391,6 +391,8 @@ API version 2 groups operations by the resource they modify:
 the operation. Likewise, `task` selects the targeted pipeline task by its `-n`/`--name` option,
 required by all task operations except `add`. `migrate` and `format` are the same in both versions.
 
+#### Opting into API version 2
+
 A migration script opts into API version 2 by setting the variable in its own process:
 
 ```bash
