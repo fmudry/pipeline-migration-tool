@@ -1,5 +1,6 @@
 import argparse
 import logging
+import re
 import shutil
 from pathlib import Path
 
@@ -184,7 +185,7 @@ class TestTaskTargetingV2:
         with pytest.raises(SystemExit):
             build_parser(ApiVersion.V2).parse_args(["task", "--help"])
         out = capsys.readouterr().out
-        assert "-n TASK-NAME, --name TASK-NAME" in out
+        assert re.search(r"-n( TASK-NAME)?, --name TASK-NAME", out)
         for operation in ("add", "add-param", "add-matrix-param", "set-bundle"):
             assert operation in out
 
