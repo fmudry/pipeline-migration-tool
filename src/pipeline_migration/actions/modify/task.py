@@ -77,7 +77,7 @@ SUBCMD_DESCRIPTION_TEMPLATE: Final = """\
    - remove-param: removes the specified param from the task
    - matrix-add-param: adds a new matrix param to the task (or updates existing)
    - matrix-remove-param: removes the specified matrix param from the task
-   - rename: renames the task in the pipeline
+{{remove-matrix-op}}   - rename: renames the task in the pipeline
    - set-bundle: sets the bundle in the taskRef resolver params
 """
 
@@ -99,6 +99,9 @@ Usage patterns:
 """,
     "{{add-task-op}}": """\
    - add: adds a new task to the pipeline from a bundle reference (takes no -n TASK-NAME)
+""",
+    "{{remove-matrix-op}}": """\
+   - remove-matrix: removes the whole matrix from the task
 """,
     "{{-n}}": "-n ",
 }
@@ -365,6 +368,14 @@ def register_operations(subparser_mod, api_version: ApiVersion) -> None:
     subparser_remove_param.add_argument("param_name", help="parameter name", metavar="PARAM-NAME")
 
     subparser_remove_param.set_defaults(action=action_matrix_remove_param)
+
+    # remove-matrix, new in API v2
+    if api_version >= ApiVersion.V2:
+        subparser_remove_matrix = subparser_mod.add_parser(
+            "remove-matrix",
+            help="Remove the whole matrix from a task.",
+        )
+        subparser_remove_matrix.set_defaults(action=action_remove_matrix)
 
     # rename
     subparser_rename = subparser_mod.add_parser(
@@ -812,6 +823,43 @@ class ModTaskMatrixRemoveParamOperation(TaskBase):
 def action_matrix_remove_param(args) -> None:
     """CLI action handler to remove a matrix parameter from a task in pipeline files."""
     op = ModTaskMatrixRemoveParamOperation(args.task_name, args.param_name)
+    run_modify(op, args)
+
+
+class ModTaskRemoveMatrixOperation(TaskBase):
+    """Operation that removes the whole matrix from a pipeline task."""
+
+    def _do_action(
+        self, tasks: CommentedSeq, path_prefix: YAMLPath, pipeline_file: FilePath, style: YAMLStyle
+    ) -> bool:
+        """Remove the matrix from the task. If the task has no matrix, this is a no-op."""
+        for index, task in enumerate(tasks):
+            if task.get("name", "") != self.task_name:
+                continue
+
+            if "matrix" not in task:
+                logger.info(
+                    "task '%s' in '%s': matrix does not exist, nothing to remove",
+                    self.task_name,
+                    pipeline_file,
+                )
+                return False
+
+            logger.info(
+                "task '%s' in '%s': matrix will be removed",
+                self.task_name,
+                pipeline_file,
+            )
+            yamledit = EditYAMLEntry(pipeline_file, style=style)
+            yamledit.delete(list(path_prefix) + [index, "matrix"])
+            return True
+
+        raise TaskNotFoundError
+
+
+def action_remove_matrix(args) -> None:
+    """CLI action handler to remove the matrix from a task in pipeline files (API v2)."""
+    op = ModTaskRemoveMatrixOperation(args.task_name)
     run_modify(op, args)
 
 
