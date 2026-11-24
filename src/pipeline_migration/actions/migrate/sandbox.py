@@ -57,6 +57,8 @@ _MODE_OFF = "off"
 
 _DEFAULT_RUNNER_REPO = "quay.io/konflux-ci/pipeline-migration-runner"
 _PULL_TIMEOUT_SECONDS = 600
+# Starting a no-op container takes well under a second
+_CHECK_TIMEOUT_SECONDS = 60
 # platform.machine() values that differ from the OCI architecture names
 _OCI_ARCHITECTURES = {"x86_64": "amd64", "aarch64": "arm64"}
 
@@ -86,8 +88,11 @@ def enabled() -> bool:
     - ``on``: require the sandbox.
     - ``off``: never use the sandbox.
 
+    When the sandbox is used, it is prepared and checked by ``prepare``.
+
     :raises SandboxError: the sandbox is required or crun and crane are installed, but the sandbox
-        cannot be prepared. Migrations never fall back to the host silently in that case.
+        cannot be prepared or does not work. Migrations never fall back to the host silently in
+        that case.
     """
     mode = os.environ.get(SANDBOX_MODE_ENV, _MODE_AUTO).lower()
     if mode not in (_MODE_AUTO, _MODE_ON, _MODE_OFF):
@@ -96,18 +101,62 @@ def enabled() -> bool:
         logger.info("Container sandbox disabled by %s=off", SANDBOX_MODE_ENV)
         return False
 
-    missing_tools = [tool for tool in ("crun", "crane") if not shutil.which(tool)]
-    if missing_tools:
-        message = f"Container sandbox unavailable, {' and '.join(missing_tools)} not found in PATH"
+    if missing_tools := _missing_tools():
+        message = _missing_tools_message(missing_tools)
         if mode == _MODE_ON:
             raise SandboxError(message)
         logger.warning("%s. Migration scripts run directly on the host.", message)
         return False
 
+    prepare()
+    return True
+
+
+def prepare() -> None:
+    """Prepare the sandbox and check that it works, regardless of PMT_SANDBOX.
+
+    The runner image is pulled and unpacked if needed, then a no-op container is started. A
+    container that cannot start (e.g. user namespaces denied by the host) would otherwise make
+    every migration script fail with crun's error, as if the scripts were broken.
+
+    :raises SandboxError: crun or crane is missing, the runner image cannot be prepared or a
+        container cannot be started.
+    """
+    if missing_tools := _missing_tools():
+        raise SandboxError(_missing_tools_message(missing_tools))
     image = _get_runner_image()
     _ensure_rootfs(image)
+    _check_container_starts()
     logger.info("Container sandbox enabled (image: %s)", image)
-    return True
+
+
+def _missing_tools() -> list[str]:
+    return [tool for tool in ("crun", "crane") if not shutil.which(tool)]
+
+
+def _missing_tools_message(missing_tools: list[str]) -> str:
+    return f"Container sandbox unavailable, {' and '.join(missing_tools)} not found in PATH"
+
+
+def _check_container_starts() -> None:
+    """Run a no-op script in the sandbox, so a broken host setup is reported as such."""
+    with tempfile.TemporaryDirectory(prefix="pmt-sandbox-check-") as tmp:
+        script = os.path.join(tmp, "check.sh")
+        pipeline = os.path.join(tmp, "pipeline.yaml")
+        with open(script, "w") as f:
+            f.write("exit 0\n")
+        with open(pipeline, "w") as f:
+            f.write("kind: Pipeline\n")
+        try:
+            result = run_migration(script, pipeline, timeout=_CHECK_TIMEOUT_SECONDS)
+        except (OSError, TimeoutError, RuntimeError) as e:
+            raise SandboxError(f"Cannot start a sandbox container: {e}") from e
+    if result.returncode != 0:
+        output = result.stdout.decode(errors="replace").strip()
+        raise SandboxError(
+            f"Cannot start a sandbox container, a no-op script exited with code "
+            f"{result.returncode}: {output}"
+        )
 
 
 def run_migration(

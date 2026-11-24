@@ -67,13 +67,25 @@ class TestEnabled:
             sandbox.enabled()
 
     @pytest.mark.parametrize("mode", ["auto", "on"])
-    def test_prepares_rootfs_once(self, monkeypatch, tools_installed, mode):
+    def test_prepares_and_checks_once(self, monkeypatch, tools_installed, mode):
         monkeypatch.setenv(sandbox.SANDBOX_MODE_ENV, mode)
         prepared = []
         monkeypatch.setattr(sandbox, "_ensure_rootfs", prepared.append)
+        monkeypatch.setattr(sandbox, "_check_container_starts", lambda: prepared.append("check"))
         assert sandbox.enabled()
         assert sandbox.enabled()
-        assert prepared == [RUNNER_IMAGE]
+        assert prepared == [RUNNER_IMAGE, "check"]
+
+    def test_container_start_failure_does_not_fall_back(self, monkeypatch, tools_installed):
+        monkeypatch.setenv(sandbox.SANDBOX_MODE_ENV, "auto")
+        monkeypatch.setattr(sandbox, "_ensure_rootfs", lambda image: None)
+
+        def fail():
+            raise SandboxError("user namespaces denied")
+
+        monkeypatch.setattr(sandbox, "_check_container_starts", fail)
+        with pytest.raises(SandboxError, match="user namespaces denied"):
+            sandbox.enabled()
 
     def test_preparation_failure_does_not_fall_back(self, monkeypatch, tools_installed):
         monkeypatch.setenv(sandbox.SANDBOX_MODE_ENV, "auto")
@@ -84,6 +96,57 @@ class TestEnabled:
         monkeypatch.setattr(sandbox, "_ensure_rootfs", fail)
         with pytest.raises(SandboxError, match="pull failed"):
             sandbox.enabled()
+
+
+class TestPrepare:
+    """prepare() is used directly by run-migration, whatever PMT_SANDBOX is set to."""
+
+    @pytest.fixture
+    def rootfs(self, tmp_path, monkeypatch) -> Path:
+        path = tmp_path / "rootfs"
+        path.mkdir()
+        monkeypatch.setattr(sandbox, "_ensure_rootfs", lambda image: str(path))
+        return path
+
+    def test_ignores_sandbox_mode(self, monkeypatch, tools_installed, rootfs):
+        monkeypatch.setenv(sandbox.SANDBOX_MODE_ENV, "off")
+        crun = FakeCrun(lambda path: 0)
+        monkeypatch.setattr(sandbox.sp, "run", crun)
+        sandbox.prepare()
+        # The check runs a no-op script on a throwaway pipeline file
+        assert len(crun.calls) == 1
+        assert crun.config["process"]["args"][2] == f"{sandbox._WORK_DIR}/pipeline.yaml"
+
+    def test_requires_tools(self, monkeypatch):
+        monkeypatch.setattr("shutil.which", lambda tool: None if tool == "crane" else "/bin/x")
+        with pytest.raises(SandboxError, match="crane not found in PATH"):
+            sandbox.prepare()
+
+    def test_container_that_cannot_start(self, monkeypatch, tools_installed, rootfs):
+        def crun(cmd, **kwargs):
+            # crun reports its own failures like a failing container process would
+            return subprocess.CompletedProcess(cmd, 1, b"unshare: Operation not permitted", b"")
+
+        monkeypatch.setattr(sandbox.sp, "run", crun)
+        with pytest.raises(
+            SandboxError, match="no-op script exited with code 1: unshare: Operation not permitted"
+        ):
+            sandbox.prepare()
+
+    @pytest.mark.parametrize(
+        "error",
+        [PermissionError(13, "Permission denied"), subprocess.TimeoutExpired("crun", 60)],
+        ids=["crun-not-executable", "timeout"],
+    )
+    def test_container_run_error(self, monkeypatch, tools_installed, rootfs, error):
+        def crun(cmd, **kwargs):
+            if "run" in cmd:
+                raise error
+            return subprocess.CompletedProcess(cmd, 0, b"", b"")
+
+        monkeypatch.setattr(sandbox.sp, "run", crun)
+        with pytest.raises(SandboxError, match="Cannot start a sandbox container"):
+            sandbox.prepare()
 
 
 class TestRunnerImage:
