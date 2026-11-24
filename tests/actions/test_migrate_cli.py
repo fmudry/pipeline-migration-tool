@@ -562,7 +562,7 @@ class TestMigrateTaskBundleUpgrade:
             doc["spec"]["tasks"] += {"name": "summary"}
             dump_yaml(pipeline_file, doc)
 
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
 
         monkeypatch.setattr("subprocess.run", _subprocess_run)
 
@@ -705,10 +705,12 @@ class TestMigrateTaskBundleUpgrade:
 
             if content == first_migration_to_run:
                 # only fail the first migration of clone task
-                return subprocess.CompletedProcess(cmd, 1, stdout="normal output")
+                return subprocess.CompletedProcess(cmd, 1, stdout=b"normal output")
 
             # Output the content to ease assertion
-            return subprocess.CompletedProcess(cmd, 0, stdout=f"migration: {content.decode()}")
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"migration: {content.decode()}".encode()
+            )
 
         monkeypatch.setattr("tempfile.mkstemp", _mkstemp)
         monkeypatch.setattr("subprocess.run", subprocess_run)
@@ -798,7 +800,7 @@ class TestMigrateTaskBundleUpgrade:
                     Path(pipeline_file).read_text().startswith("kind: Pipeline")
                 ), "Pipeline file does not have kind Pipeline."
             assert Path(cmd[-2]).read_text() in migration_scripts
-            return subprocess.CompletedProcess(cmd, 0, stdout="migration is done.")
+            return subprocess.CompletedProcess(cmd, 0, stdout=b"migration is done.")
 
         monkeypatch.setattr("subprocess.run", subprocess_run)
 
@@ -1509,7 +1511,7 @@ def test_apply_migration_by_bundle_references(
     def _subprocess_run(cmd, *args, **kwargs):
         pipeline_file = cmd[-1]
         modified_package_files.add(pipeline_file)
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr("subprocess.run", _subprocess_run)
     monkeypatch.chdir(component_a_repo)
