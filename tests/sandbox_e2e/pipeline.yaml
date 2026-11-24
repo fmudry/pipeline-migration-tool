@@ -1,0 +1,32 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: canary-on-pull-request
+spec:
+  pipelineSpec:
+    tasks:
+      - name: init
+        taskRef:
+          resolver: bundles
+          params:
+            - name: name
+              value: init
+            - name: bundle
+              value: quay.io/konflux-ci/tekton-catalog/task-init:0.2@sha256:0000000000000000000000000000000000000000000000000000000000000000
+            - name: kind
+              value: task
+      - name: hello
+        runAfter:
+          - init
+        params:
+          - name: greeting
+            value: hi
+        taskRef:
+          resolver: bundles
+          params:
+            - name: name
+              value: hello
+            - name: bundle
+              value: quay.io/konflux-ci/tekton-catalog/task-hello:0.2@sha256:0000000000000000000000000000000000000000000000000000000000000000
+            - name: kind
+              value: task

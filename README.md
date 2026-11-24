@@ -494,6 +494,14 @@ source .venv/bin/activate
 tox
 ```
 
+The sandbox e2e tests in `tests/sandbox_e2e/` run the sandbox for real. They are skipped unless
+`PMT_SANDBOX_E2E=1` is set, and need `crun` and `crane` in `PATH`, unprivileged user namespaces
+and a runner image:
+
+```bash
+PMT_SANDBOX_E2E=1 PMT_RUNNER_IMAGE=<runner image> tox -e py312 -- tests/sandbox_e2e
+```
+
 ## Integration test
 
 pipeline-migration-tool relies on task bundles are annotated and migrations are attached properly.

@@ -1,0 +1,82 @@
+name: Sandbox e2e
+# Runs the migration script sandbox for real (crun, crane and the runner image built from this
+# checkout) and checks the sandbox contract with the canary scripts in tests/sandbox_e2e/.
+"on":
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+env:
+  # The version pinned in the MintMaker Renovate image
+  CRANE_VERSION: "0.22.1"
+  CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
+  PMT_RUNNER_IMAGE: localhost:5000/pipeline-migration-runner:test
+jobs:
+  sandbox-e2e:
+    name: Sandbox e2e (crun ${{ matrix.crun.version }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        crun:
+          # The version in the MintMaker Renovate image
+          - version: "1.30.1"
+            sha256: 86d1e6a0e76945975d3aebfab39cbc6a26eea15f1c3fc66b6776d19e5dc346a0
+          - version: "1.31"
+            sha256: 8cacae171bb0e5f9e275adac2eeb2c6ec8c69fdedff7b008eadd8cdd25b0d349
+    services:
+      # crane pulls the runner image from a registry, as in production
+      registry:
+        image: docker.io/library/registry:3.1.2@sha256:82f6ff4a7f982960c8aa51617fea3aabc485df6e55cce80d22deb1de36f1bc3c
+        ports:
+          - 5000:5000
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Install crun and crane
+        env:
+          CRUN_VERSION: ${{ matrix.crun.version }}
+          CRUN_SHA256: ${{ matrix.crun.sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o /tmp/crun \
+              "https://github.com/containers/crun/releases/download/${CRUN_VERSION}/crun-${CRUN_VERSION}-linux-amd64"
+          echo "${CRUN_SHA256}  /tmp/crun" | sha256sum -c -
+          install -m 0755 /tmp/crun "$HOME/.local/bin/crun"
+          curl -fsSL -o /tmp/crane.tar.gz \
+              "https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "${CRANE_SHA256}  /tmp/crane.tar.gz" | sha256sum -c -
+          tar xzf /tmp/crane.tar.gz -C "$HOME/.local/bin" crane
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Allow unprivileged user namespaces
+        # Ubuntu 24.04 restricts unprivileged user namespaces with AppArmor, which prevents crun
+        # from starting the rootless sandbox. The runner is a throwaway VM, and the rules inside
+        # the sandbox do not depend on this setting.
+        run: |
+          probe() {
+              unshare --user --map-root-user --mount sh -c 'mount -t tmpfs none /mnt'
+          }
+          if ! probe; then
+              sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+              probe
+          fi
+          crun --version
+      - name: Build the runner image
+        run: |
+          docker build -f Containerfile.runner -t "$PMT_RUNNER_IMAGE" .
+          docker push "$PMT_RUNNER_IMAGE"
+      - name: Install dependencies
+        run: make venv/create
+      - name: Run sandbox e2e tests
+        env:
+          PMT_SANDBOX_E2E: "1"
+        run: |
+          source .venv/bin/activate
+          tox -e py312 -- tests/sandbox_e2e -v
