@@ -1,5 +1,6 @@
 import argparse
 import logging
+import re
 import shutil
 from pathlib import Path
 
@@ -113,6 +114,9 @@ def test_reject_unsupported_api_version(monkeypatch, capsys):
         pytest.param(
             "2", ["task", "-n", "clone", "matrix-add-param", "p", "v"], id="v2-renamed-op"
         ),
+        pytest.param(
+            "1", ["modify", "task", "clone", "remove-matrix"], id="v1-has-no-remove-matrix"
+        ),
     ],
 )
 def test_commands_unavailable_in_other_api_version(api_version, args, monkeypatch):
@@ -181,7 +185,7 @@ class TestTaskTargetingV2:
         with pytest.raises(SystemExit):
             build_parser(ApiVersion.V2).parse_args(["task", "--help"])
         out = capsys.readouterr().out
-        assert "-n TASK-NAME, --name TASK-NAME" in out
+        assert re.search(r"-n( TASK-NAME)?, --name TASK-NAME", out)
         for operation in ("add", "add-param", "add-matrix-param", "set-bundle"):
             assert operation in out
 
@@ -332,6 +336,37 @@ def test_v2_dry_run_does_not_modify_files(
     assert "new-param" in capsys.readouterr().out
 
 
+def test_v2_task_remove_matrix(pipeline_and_run_yaml, tmp_path, monkeypatch):
+    pipeline_file = tmp_path / "pipeline.yaml"
+    pipeline_file.write_text(pipeline_and_run_yaml)
+    task = ["task", "-f", str(pipeline_file), "-n", "clone"]
+
+    run_pmt(monkeypatch, "2", *task, "add-matrix-param", "-t", "array", "p", "a", "b")
+    assert "matrix:" in pipeline_file.read_text()
+
+    run_pmt(monkeypatch, "2", *task, "remove-matrix")
+    assert pipeline_file.read_text() == pipeline_and_run_yaml
+
+
+def test_v2_task_remove_matrix_dry_run(pipeline_and_run_yaml, tmp_path, monkeypatch, capsys):
+    pipeline_file = tmp_path / "pipeline.yaml"
+    pipeline_file.write_text(pipeline_and_run_yaml)
+    task = ["task", "-f", str(pipeline_file), "-n", "clone"]
+    run_pmt(monkeypatch, "2", *task, "add-matrix-param", "p", "a")
+    content_with_matrix = pipeline_file.read_text()
+    capsys.readouterr()
+
+    run_pmt(monkeypatch, "2", *task, "--dry-run", "remove-matrix")
+
+    assert pipeline_file.read_text() == content_with_matrix
+    removed_lines = [
+        line[1:].strip()
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("-") and not line.startswith("---")
+    ]
+    assert removed_lines[0] == "matrix:"
+
+
 @responses.activate
 @pytest.mark.parametrize(
     "v1_options,v2_options,run_after,check_finally",
@@ -410,11 +445,16 @@ def test_render_resource_description(api_version, resource, capsys):
         (
             ApiVersion.V1,
             ["matrix-add-param", "pmt modify task push-dockerfile add-param"],
-            ["add-matrix-param", "pmt task add", " -n "],
+            ["add-matrix-param", "remove-matrix:", "pmt task add", " -n "],
         ),
         (
             ApiVersion.V2,
-            ["add-matrix-param", "pmt task add", "pmt task -n push-dockerfile add-param"],
+            [
+                "add-matrix-param",
+                "remove-matrix:",
+                "pmt task add",
+                "pmt task -n push-dockerfile add-param",
+            ],
             ["matrix-add-param"],
         ),
     ],
