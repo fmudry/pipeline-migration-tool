@@ -18,8 +18,8 @@ Migration script contract inside the sandbox:
 - When the script succeeds, the result is copied back to the original pipeline file. When it
   fails, the original file is left untouched. The result must be a regular file.
 - Only PATH, HOME and the variables of ``MIGRATION_SCRIPT_ENV`` (PMT_API_VERSION,
-  PMT_IN_MIGRATION) are set. There is no /proc, so bash process substitution ``<(...)`` and
-  /dev/stdin do not work.
+  PMT_IN_MIGRATION) are set. There is no /proc, so /dev/stdin and /dev/fd do not work. The bash
+  of the runner image implements process substitution ``<(...)`` with named pipes, so it works.
 
 The runner image is flattened into a single filesystem tarball by ``crane export``
 (go-containerregistry), which applies the layers and their whiteouts. The tarball is extracted into

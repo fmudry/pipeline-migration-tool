@@ -1,0 +1,62 @@
+# Runner image of the migration script sandbox (src/pipeline_migration/actions/migrate/sandbox.py).
+# Migration scripts run in a rootless crun container built from this image, so it holds the tools
+# that migration scripts may use: bash, pmt, yq, jq, git and python3.
+#
+# Build from the repository root:
+#   podman build -f Containerfile.runner -t pipeline-migration-runner .
+
+# The sandbox has no /proc by design, so /dev/fd does not exist. Stock bash implements process
+# substitution (<(...), < <(...)) via /dev/fd; this bash is built to use named pipes instead.
+FROM registry.access.redhat.com/ubi10-minimal:10.3@sha256:d63890a635f8f19177bce1775f74f587a47f4456844f1392456c4e3673a48753 AS bash-build
+ARG BASH_SRC_VERSION=5.2.37
+ARG BASH_SHA256=9599b22ecd1d5787ad7d3b7bf0c59f312b3396d1e281175dd1f8a4014da621ff
+# ncurses-devel: without it configure falls back to bash's bundled termcap, which GCC 14 rejects
+RUN microdnf install -y gcc make tar gzip ncurses-devel && microdnf clean all
+RUN curl -fsSL --retry 5 --retry-all-errors -o /tmp/bash.tar.gz \
+        https://ftp.gnu.org/gnu/bash/bash-${BASH_SRC_VERSION}.tar.gz && \
+    echo "${BASH_SHA256}  /tmp/bash.tar.gz" | sha256sum -c - && \
+    tar xzf /tmp/bash.tar.gz -C /tmp && \
+    cd /tmp/bash-${BASH_SRC_VERSION} && \
+    bash_cv_dev_fd=absent ./configure --without-bash-malloc && \
+    make -j"$(nproc)" && \
+    install -m 0755 bash /usr/local/bin/bash
+# Fail the build unless process substitution uses a named pipe and works
+RUN path=$(/usr/local/bin/bash -c 'echo <(true)') && echo "procsub path: $path" && \
+    case "$path" in /dev/fd/*) exit 1 ;; esac && \
+    test "$(/usr/local/bin/bash -c 'cat < <(echo ok)')" = ok
+
+FROM registry.access.redhat.com/ubi10-minimal:10.3@sha256:d63890a635f8f19177bce1775f74f587a47f4456844f1392456c4e3673a48753
+LABEL name="pipeline-migration-runner"
+LABEL summary="Runner image of the pipeline-migration-tool migration script sandbox"
+
+RUN microdnf install -y bash git python3.12 python3.12-pip jq && microdnf clean all
+
+# /usr/local/bin precedes /usr/bin in the sandbox PATH, so `bash script.sh` uses this build
+COPY --from=bash-build /usr/local/bin/bash /usr/local/bin/bash
+# Same check in the final image, which also proves the binary links against its libraries here
+RUN path=$(bash -c 'echo <(true)') && echo "procsub path: $path" && \
+    case "$path" in /dev/fd/*) exit 1 ;; esac && \
+    test "$(bash -c 'cat < <(echo ok)')" = ok
+
+ARG TARGETARCH=amd64
+ARG YQ_VERSION=4.53.6
+ARG YQ_SHA256_amd64=c5f056448f973ae7d39b5401949648a78f2dc1947d6a8eb65be60d5c504b9385
+ARG YQ_SHA256_arm64=88a1016bc1d657375a35864e4f44b6f333df8ff97b559f51bba0adcb2169df09
+RUN curl -fsSL --retry 5 --retry-all-errors -o /usr/bin/yq \
+        "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${TARGETARCH}" && \
+    case "${TARGETARCH}" in \
+        amd64) sha256="${YQ_SHA256_amd64}" ;; \
+        arm64) sha256="${YQ_SHA256_arm64}" ;; \
+        *) echo "unsupported architecture ${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    echo "${sha256}  /usr/bin/yq" | sha256sum -c - && \
+    chmod 0755 /usr/bin/yq
+
+# pmt from this repository, with the pinned dependencies of the tool image
+COPY requirements.txt /src/
+RUN pip3.12 install --no-cache-dir -r /src/requirements.txt
+COPY pyproject.toml VERSION README.md LICENSE /src/
+COPY src /src/src
+RUN pip3.12 install --no-cache-dir --no-deps /src && \
+    rm -rf /src && \
+    pmt --version
