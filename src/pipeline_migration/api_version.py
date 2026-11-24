@@ -26,6 +26,15 @@ DEFAULT_API_VERSION: Final = ApiVersion.V1
 # DEFAULT_API_VERSION, so changing the default for interactive use never breaks released scripts.
 MIGRATION_API_VERSION: Final = ApiVersion.V1
 
+# Environment variables pmt migrate sets for migration scripts, on the host and in the sandbox.
+# A script that does not choose an API version gets the one of migration scripts, even if
+# pmt migrate itself inherited another one (e.g. from Mintmaker or a user).
+# pmt invocations inside the script do not log their API version, pmt migrate logs it.
+MIGRATION_SCRIPT_ENV: Final[Mapping[str, str]] = {
+    ENV_API_VERSION: str(MIGRATION_API_VERSION),
+    ENV_IN_MIGRATION: "1",
+}
+
 
 class UnsupportedApiVersion(ValueError):
     """The requested API version is not supported by this pmt release."""

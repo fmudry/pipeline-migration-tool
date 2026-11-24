@@ -14,9 +14,11 @@ from jsonschema.exceptions import ValidationError
 from jsonschema.validators import Draft202012Validator
 from ruamel.yaml.error import YAMLError
 
+from pipeline_migration.actions.migrate import sandbox
 from pipeline_migration.actions.migrate.constants import (
     ANNOTATION_IS_MIGRATION,
     MIGRATION_IMAGE_TAG_LIKE_PATTERN,
+    MIGRATION_TIMEOUT_SECONDS,
     SCHEMA_UPGRADE,
     logger,
 )
@@ -30,11 +32,7 @@ from pipeline_migration.actions.migrate.models import PackageFile, TaskBundleUpg
 from pipeline_migration.actions.migrate.resolvers import Resolver
 from pipeline_migration.actions.migrate.resolvers.migration_images import MigrationImageTag
 
-from pipeline_migration.api_version import (
-    ENV_API_VERSION,
-    ENV_IN_MIGRATION,
-    MIGRATION_API_VERSION,
-)
+from pipeline_migration.api_version import MIGRATION_SCRIPT_ENV
 from pipeline_migration.quay import list_active_repo_tags
 from pipeline_migration.registry import REGISTRY, Container, ImageIndex, Registry
 from pipeline_migration.pipeline import NotAPipelineFile, PipelineFileOperation
@@ -59,16 +57,11 @@ class MigrationFileOperation(PipelineFileOperation):
             raised as a group at once. Every raw exception is wrapped inside MigrationApplyError.
         """
         fd, migration_file = tempfile.mkstemp(suffix="-migration-file")
-        # A script that does not choose an API version gets the one of migration scripts, even if
-        # pmt migrate itself inherited another one (e.g. from Mintmaker or a user).
-        # pmt invocations inside the script do not log their API version, it is logged below.
-        migration_env = {
-            **os.environ,
-            ENV_API_VERSION: str(MIGRATION_API_VERSION),
-            ENV_IN_MIGRATION: "1",
-        }
+        # The sandbox sets MIGRATION_SCRIPT_ENV in the container itself
+        migration_env = {**os.environ, **MIGRATION_SCRIPT_ENV}
         prev_size = 0
         errors: list[Exception] = []
+        use_sandbox = sandbox.enabled()
 
         for bundle_upgrade in self._task_bundle_upgrades:
             for migration in bundle_upgrade.migrations:
@@ -86,10 +79,21 @@ class MigrationFileOperation(PipelineFileOperation):
                         os.truncate(fd, len(content))
                     prev_size = os.write(fd, content)
 
-                    cmd = ["bash", migration_file, str(file_path)]
-                    logger.debug("Run: %r", cmd)
-                    proc = sp.run(cmd, stderr=sp.STDOUT, stdout=sp.PIPE, env=migration_env)
-                    logger.debug("%r", proc.stdout)
+                    if use_sandbox:
+                        proc = sandbox.run_migration(
+                            migration_file, str(file_path), timeout=MIGRATION_TIMEOUT_SECONDS
+                        )
+                    else:
+                        cmd = ["bash", migration_file, str(file_path)]
+                        logger.debug("Run: %r", cmd)
+                        proc = sp.run(
+                            cmd,
+                            stderr=sp.STDOUT,
+                            stdout=sp.PIPE,
+                            env=migration_env,
+                            timeout=MIGRATION_TIMEOUT_SECONDS,
+                        )
+                    _log_migration_output(proc)
                     proc.check_returncode()
                 except Exception as e:
                     err_msg = f"Failed to apply migration: {str(e)}"
@@ -144,6 +148,14 @@ class MigrationFileOperation(PipelineFileOperation):
             modified_pipeline = load_yaml(temp_pipeline_file, style=yaml_style)
             original_pipeline_doc["spec"]["pipelineSpec"] = modified_pipeline["spec"]
             dump_yaml(file_path, original_pipeline_doc, style=yaml_style)
+
+
+def _log_migration_output(proc: sp.CompletedProcess[bytes]) -> None:
+    output = proc.stdout.decode(errors="replace")
+    if proc.returncode == 0:
+        logger.debug("Migration script output:\n%s", output)
+    else:
+        logger.error("Migration script exited with code %d, output:\n%s", proc.returncode, output)
 
 
 class TransitionToModifyCommandOperation(MigrationFileOperation):
@@ -244,6 +256,10 @@ class TaskBundleUpgradesManager:
         """
         errors: list[Exception] = []
         processed_files: list[str] = []
+
+        # Decided before touching any file, so a broken sandbox fails the run once with a clear
+        # sandbox.SandboxError instead of failing every migration of every file
+        sandbox.enabled()
 
         for package_file in self.package_files:
             try:
