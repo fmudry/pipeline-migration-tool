@@ -12,6 +12,7 @@ from pipeline_migration.actions.modify.task import register_cli_v2 as register_t
 from pipeline_migration.actions.migrate.cli import action as migrate_action
 from pipeline_migration.actions.migrate.cli import register_cli as register_migrate_cli
 from pipeline_migration.actions.format import register_cli as register_format_cli
+from pipeline_migration.actions.run_migration import register_cli as register_run_migration_cli
 from pipeline_migration.api_version import (
     ENV_API_VERSION,
     ENV_IN_MIGRATION,
@@ -48,11 +49,12 @@ def build_parser(api_version: ApiVersion) -> argparse.ArgumentParser:
             assert_never(api_version)
 
     register_format_cli(subparser)
+    register_run_migration_cli(subparser)
     return parser
 
 
-def main() -> None:
-    """Parse CLI arguments and execute the requested subcommand."""
+def main() -> int | None:
+    """Parse CLI arguments, execute the requested subcommand and return its exit status."""
     try:
         api_version = get_api_version()
     except UnsupportedApiVersion as e:
@@ -62,13 +64,13 @@ def main() -> None:
     # it runs, so pmt invocations inside those scripts do not log it again.
     if args.action is not migrate_action and not os.environ.get(ENV_IN_MIGRATION):
         logger.info("Using CLI API version %s (%s)", api_version, api_version_source())
-    args.action(args)
+    return args.action(args)
 
 
 def entry_point():
-    """Entry point for the pmt CLI; returns 1 on failure."""
+    """Entry point for the pmt CLI; returns the subcommand's exit status, or 1 on failure."""
     try:
-        main()
+        return main()
     except Exception as e:
         logger.exception("Cannot do migration for pipeline. Reason: %r", e)
         return 1

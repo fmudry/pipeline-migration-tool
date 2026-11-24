@@ -37,8 +37,8 @@ def run_pmt(monkeypatch, api_version: str | None, *args: str) -> None:
 @pytest.mark.parametrize(
     "api_version,expected",
     [
-        (ApiVersion.V1, {"migrate", "add-task", "modify", "format"}),
-        (ApiVersion.V2, {"migrate", "task", "pipeline", "generic", "format"}),
+        (ApiVersion.V1, {"migrate", "add-task", "modify", "format", "run-migration"}),
+        (ApiVersion.V2, {"migrate", "task", "pipeline", "generic", "format", "run-migration"}),
     ],
 )
 def test_subcommands_of_api_version(api_version, expected):
@@ -51,7 +51,7 @@ def test_default_to_api_v1(monkeypatch, capsys):
     with pytest.raises(SystemExit):
         entry_point()
     out = capsys.readouterr().out
-    assert "{migrate,add-task,modify,format}" in out
+    assert "{migrate,add-task,modify,format,run-migration}" in out
     assert "API version 1" in out
 
 

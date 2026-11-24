@@ -122,6 +122,51 @@ pmt migrate -u '<upgrades>' --allowlist 'quay.io/konflux-ci/tekton-catalog/task-
 > Use `*` to match a single path segment (e.g. `quay.io/konflux-ci/tekton-catalog/*`).
 > A pattern without wildcards matches only the exact image repository name.
 
+### Migration script sandbox
+
+Migration scripts are downloaded from registries, so `migrate` runs each one in a rootless `crun`
+container built from the runner image (see `Containerfile.runner`). The environment variable
+`PMT_SANDBOX` selects the policy:
+
+- `auto` (default): use the sandbox when `crun` and `crane` are installed, otherwise warn and run
+  the scripts directly on the host.
+- `on`: require the sandbox.
+- `off`: never use the sandbox.
+
+`PMT_RUNNER_IMAGE` overrides the runner image, which defaults to the image of the running
+`pmt` version.
+
+Inside the sandbox, a migration script:
+
+- runs as `bash <script> <pipeline file>`. The pipeline file is a copy in a private, writable work
+  directory, which is also the working directory. The original file is updated only when the
+  script succeeds, and only with a regular file.
+- sees only `PATH`, `HOME`, `PMT_API_VERSION` and `PMT_IN_MIGRATION` in its environment, as
+  set by `pmt migrate`.
+- has no `/proc`, so `/proc/self/...`, `/dev/stdin` and `/dev/fd/...` do not exist. Bash process
+  substitution `<(...)` works.
+- can write only to the work directory, `/tmp` and `HOME`.
+- can use only the tools of the runner image: `bash`, `pmt`, `yq`, `jq`, `git` and `python3`.
+- has network access.
+
+### Test a migration script in the sandbox with `run-migration`
+
+`run-migration` runs a migration script on a pipeline file in the sandbox exactly as `migrate`
+does, whatever `PMT_SANDBOX` is set to. Task repositories use it to check their migration scripts
+before releasing them:
+
+```bash
+pmt run-migration task/hello/0.2/migrations/0.2.1.sh .tekton/component-pull-request.yaml
+```
+
+The script output is written to stdout. The exit status is the one of the script, except:
+
+- `1`: the script left no usable pipeline file (removed it or replaced it by a symlink), or exited
+  with `124` or `125` itself.
+- `124`: the script did not finish within `--timeout` seconds (default 600).
+- `125`: the sandbox cannot be used on this machine, e.g. `crun` is missing or user namespaces are
+  not allowed. This is not a problem of the script.
+
 ### Add a task to build pipeline with `add-task`
 
 Sub-command `add-task` provides rich options to add a task via bundle reference to build pipelines in local
